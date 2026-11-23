@@ -1,0 +1,1715 @@
+diff --git a/python/sglang/kernels/ops/lora/moe/fused_moe_lora_kernel.py b/python/sglang/kernels/ops/lora/moe/fused_moe_lora_kernel.py
+index b0c85481e..dbe22e049 100644
+--- a/python/sglang/kernels/ops/lora/moe/fused_moe_lora_kernel.py
++++ b/python/sglang/kernels/ops/lora/moe/fused_moe_lora_kernel.py
+@@ -339,6 +339,7 @@ def _fused_moe_lora_expand(
+     split_k: int,
+     mul_routed_weight: bool = False,
+     offset: int = 0,
++    interleaved_output: bool = False,
+ ) -> None:
+ 
+     b_ptr = _get_ptr(lora_b_stacked, device)
+@@ -404,7 +405,11 @@ def _fused_moe_lora_expand(
+         **expand_config,
+     )
+     for i in range(num_slices):
+-        output[:, :, i * N + offset : (i + 1) * N + offset] += b_intermediate_cache1[i]
++        if interleaved_output:
++            assert offset == 0 and output.shape[-1] == num_slices * N
++            output[:, :, i::num_slices] += b_intermediate_cache1[i]
++        else:
++            output[:, :, i * N + offset : (i + 1) * N + offset] += b_intermediate_cache1[i]
+ 
+ 
+ @torch.inference_mode()
+@@ -442,6 +447,7 @@ def _fused_moe_lora(
+     mul_routed_weight: bool = False,
+     fully_sharded: bool = False,
+     offset: int = 0,
++    interleaved_output: bool = False,
+ ) -> None:
+     assert len(lora_a_stacked) == len(lora_b_stacked) > 0
+     assert (
+@@ -562,6 +568,7 @@ def _fused_moe_lora(
+         expand_split_k,
+         mul_routed_weight,
+         offset,
++        interleaved_output,
+     )
+ 
+ 
+@@ -595,6 +602,7 @@ def _fused_moe_lora_fake(
+     mul_routed_weight: bool = False,
+     fully_sharded: bool = False,
+     offset: int = 0,
++    interleaved_output: bool = False,
+ ) -> None:
+     return
+ 
+@@ -661,6 +669,7 @@ def _fused_moe_lora_expand_fake(
+     split_k: int,
+     mul_routed_weight: bool = False,
+     offset: int = 0,
++    interleaved_output: bool = False,
+ ) -> None:
+     return
+ 
+diff --git a/python/sglang/kernels/ops/lora/moe/virtual_experts.py b/python/sglang/kernels/ops/lora/moe/virtual_experts.py
+index e8b35e446..d6df22b7d 100644
+--- a/python/sglang/kernels/ops/lora/moe/virtual_experts.py
++++ b/python/sglang/kernels/ops/lora/moe/virtual_experts.py
+@@ -273,11 +273,17 @@ def _invoke_moe_lora_shrink_splitk(
+     SPLIT_K = min(max_split_k, max(1, 128 // base_grid)) if base_grid < 128 else 1
+ 
+     grid = (SPLIT_K * base_grid,)
++    # Split-K partial sums must not be rounded to BF16 before each atomic add.
++    # Small decode batches use many splits, amplifying that rounding error.
++    # Keep the parallel reduction in FP32, then round once to the LoRA dtype.
++    reduction_output = (
++        torch.zeros_like(output, dtype=torch.float32) if SPLIT_K > 1 else output
++    )
+ 
+     _moe_lora_shrink_splitk_kernel[grid](
+         hidden_states,
+         weight,
+-        output,
++        reduction_output,
+         sorted_token_ids,
+         expert_ids,
+         num_tokens_post_padded,
+@@ -289,8 +295,8 @@ def _invoke_moe_lora_shrink_splitk(
+         weight.stride(0),
+         weight.stride(1),
+         weight.stride(2),
+-        output.stride(0),
+-        output.stride(1),
++        reduction_output.stride(0),
++        reduction_output.stride(1),
+         top_k=top_k,
+         BLOCK_SIZE_M=BLOCK_SIZE_M,
+         BLOCK_SIZE_N=BLOCK_SIZE_N,
+@@ -300,6 +306,8 @@ def _invoke_moe_lora_shrink_splitk(
+         num_warps=config.get("num_warps", 4),
+         num_stages=config.get("num_stages", 4),
+     )
++    if SPLIT_K > 1:
++        output.copy_(reduction_output)
+ 
+ 
+ def _align_block_size_jit(
+diff --git a/python/sglang/srt/arg_groups/fields/lora.py b/python/sglang/srt/arg_groups/fields/lora.py
+index c7ea9ea8f..b8118932c 100644
+--- a/python/sglang/srt/arg_groups/fields/lora.py
++++ b/python/sglang/srt/arg_groups/fields/lora.py
+@@ -110,3 +110,30 @@ class Lora(msgspec.Struct):
+         float,
+         "When any LoRA adapter request waits longer than this threshold (in seconds), the scheduler will selectively drain one running adapter to make room. This mitigates extreme tail latency under high or skewed workloads by preventing a small set of adapters from monopolizing batch slots. Set to 0 to disable draining (default).",
+     ] = 0.0
++
++    # -------------------------------------------------------------------------
++    # Soft prompts (input-only learned embeddings, one per tenant)
++    # -------------------------------------------------------------------------
++    enable_soft_prompt: A[
++        bool,
++        "Enable multi-tenant soft prompts. Requests name a registered prompt via `soft_prompt`; placeholder positions receive the prompt's embeddings and the prefix cache is namespaced per prompt.",
++    ] = False
++    max_soft_prompts: A[
++        int,
++        "Maximum number of soft prompts resident in the GPU pool at once.",
++    ] = 64
++    max_soft_prompt_len: A[
++        int,
++        "Maximum soft prompt length in tokens (pool row width).",
++    ] = 1024
++    soft_prompt_placeholder_id: A[
++        Optional[int],
++        "Token id used as the soft-prompt placeholder. Must be a vocabulary id the model never needs to see as real text (e.g. an unused padded-vocab row). Required when --enable-soft-prompt is set.",
++    ] = None
++    soft_prompt_paths: A[
++        Optional[List[str]],
++        Arg(
++            help="Soft prompts to load at startup, as NAME=PATH (safetensors with one [length, hidden_size] tensor).",
++            nargs="*",
++        ),
++    ] = None
+diff --git a/python/sglang/srt/entrypoints/http_server.py b/python/sglang/srt/entrypoints/http_server.py
+index 7165a5ca8..4b47463e3 100644
+--- a/python/sglang/srt/entrypoints/http_server.py
++++ b/python/sglang/srt/entrypoints/http_server.py
+@@ -139,6 +139,7 @@ from sglang.srt.managers.io_struct import (
+     InitWeightsUpdateGroupReqInput,
+     LoadLoRAAdapterFromTensorsReqInput,
+     LoadLoRAAdapterReqInput,
++    LoadSoftPromptReqInput,
+     OpenSessionReqInput,
+     ParseFunctionCallReq,
+     PauseGenerationReqInput,
+@@ -151,6 +152,7 @@ from sglang.srt.managers.io_struct import (
+     SetInternalStateReq,
+     SlowDownReqInput,
+     UnloadLoRAAdapterReqInput,
++    UnloadSoftPromptReqInput,
+     UpdateWeightFromDiskReqInput,
+     UpdateWeightsFromDistributedReqInput,
+     UpdateWeightsFromIPCReqInput,
+@@ -1649,6 +1651,35 @@ async def unload_lora_adapter(
+     return ORJSONResponse(msgspec_to_builtins(result), status_code=status_code)
+ 
+ 
++@app.api_route("/load_soft_prompt", methods=["POST"])
++@auth_level(AuthLevel.ADMIN_OPTIONAL)
++async def load_soft_prompt(
++    obj: Annotated[LoadSoftPromptReqInput, Body()], request: Request
++):
++    """Load (or reload) a tenant soft prompt into the GPU pool."""
++    result = await _global_state.tokenizer_manager.load_soft_prompt(obj, request)
++    status_code = HTTPStatus.OK if result.success else HTTPStatus.BAD_REQUEST
++    return ORJSONResponse(msgspec_to_builtins(result), status_code=status_code)
++
++
++@app.api_route("/unload_soft_prompt", methods=["POST"])
++@auth_level(AuthLevel.ADMIN_OPTIONAL)
++async def unload_soft_prompt(
++    obj: Annotated[UnloadSoftPromptReqInput, Body()], request: Request
++):
++    """Remove a tenant soft prompt from the GPU pool."""
++    result = await _global_state.tokenizer_manager.unload_soft_prompt(obj, request)
++    status_code = HTTPStatus.OK if result.success else HTTPStatus.BAD_REQUEST
++    return ORJSONResponse(msgspec_to_builtins(result), status_code=status_code)
++
++
++@app.api_route("/list_soft_prompts", methods=["GET"])
++async def list_soft_prompts():
++    """Registered soft prompts: name -> {length, version}."""
++    registry = _global_state.tokenizer_manager.soft_prompt_registry
++    return {name: {"length": l, "version": v} for name, (l, v) in registry.items()}
++
++
+ @app.api_route("/open_session", methods=["GET", "POST"])
+ async def open_session(obj: Annotated[OpenSessionReqInput, Body()], request: Request):
+     """Open a session, and return its unique session id."""
+diff --git a/python/sglang/srt/lora/layers.py b/python/sglang/srt/lora/layers.py
+index 9e47c6c4b..40eb2c173 100644
+--- a/python/sglang/srt/lora/layers.py
++++ b/python/sglang/srt/lora/layers.py
+@@ -1149,6 +1149,7 @@ class FusedMoEWithLoRA(BaseLayerWithLoRA):
+             experts_shared_outer_loras=self.experts_shared_outer_loras,
+             cg_buffers=cg_buffers,
+             lora_use_virtual_experts=self.lora_use_virtual_experts,
++            gate_up_interleaved=self._uses_interleaved_gate_up,
+         )
+ 
+     def forward(self, hidden_states: torch.Tensor, topk_output: TopKOutput, **kwargs):
+diff --git a/python/sglang/srt/lora/lora.py b/python/sglang/srt/lora/lora.py
+index c154e1c55..edb41e6c9 100644
+--- a/python/sglang/srt/lora/lora.py
++++ b/python/sglang/srt/lora/lora.py
+@@ -19,6 +19,7 @@
+ # https://github.com/vllm-project/vllm/blob/4abf6336ec65c270343eb895e7b18786e9274176/vllm/lora/layers.py
+ 
+ import logging
++import os
+ import re
+ from typing import Dict, List, Optional
+ 
+@@ -142,6 +143,17 @@ class LoRAAdapter(nn.Module):
+ 
+     def initialize_weights(self):
+         model_path = self.config.path
++        from sglang.srt.unique_adapter_cpu_store import weights as shared_weights
++        tensors = shared_weights(model_path)
++        if tensors is not None:
++            # Already normalized once by the CPU owner, bitwise-checked against
++            # these normalization methods. Keep views; no per-TP-rank clone.
++            for name, tensor in tensors.items():
++                layer_id = get_layer_id(name)
++                if layer_id is None:
++                    raise ValueError(f"Unexpected shared CPU tensor: {name}")
++                self.layers[layer_id].weights[name] = tensor
++            return
+         loader = DefaultModelLoader(self.load_config)
+         revision = getattr(self.config.hf_config, "revision", None)
+ 
+@@ -164,6 +176,9 @@ class LoRAAdapter(nn.Module):
+     def _process_weight(self, name: str, loaded_weight: torch.Tensor):
+         from sglang.srt.lora.utils import get_normalized_target_modules
+ 
++        if os.environ.get("UNIQUE_ADAPTER_AUDIT"):
++            loaded_weight = loaded_weight.cpu().clone()
++
+         normalized_target_modules = get_normalized_target_modules(
+             self.config.target_modules
+         )
+diff --git a/python/sglang/srt/lora/lora_manager.py b/python/sglang/srt/lora/lora_manager.py
+index 9327307b3..346e92b5d 100644
+--- a/python/sglang/srt/lora/lora_manager.py
++++ b/python/sglang/srt/lora/lora_manager.py
+@@ -16,6 +16,8 @@
+ # and "Punica: Multi-Tenant LoRA Serving"
+ 
+ import logging
++import os
++import time
+ import re
+ from typing import Dict, Iterable, List, Optional, Sequence
+ 
+@@ -314,6 +316,14 @@ class LoRAManager:
+             # keep metadata for displayed messages
+             self.lora_refs[lora_ref.lora_id] = lora_ref
+             self.num_pinned_loras += int(lora_ref.pinned)
++            if os.environ.get("UNIQUE_ADAPTER_RESIDENT") == "1":
++                # Explicit finite all-resident diagnostic, never enabled in E2E.
++                self.fetch_new_loras(set(self.loras))
++                torch.cuda.synchronize()
++            if os.environ.get("UNIQUE_ADAPTER_AUDIT"):
++                # The HTTP response comes from TP0. Finish CPU staging (and,
++                # for the diagnostic, GPU copies) on every rank before it replies.
++                get_parallel().tp_group.barrier()
+         except Exception as e:
+             return self.create_lora_update_result(
+                 success=False,
+@@ -453,6 +463,7 @@ class LoRAManager:
+         new_uids = {
+             uid for uid in cur_uids if uid not in self.memory_pool.uid_to_buffer_id
+         }
++        audit_start = time.monotonic_ns()
+         self.memory_pool.prepare_lora_batch(
+             cur_uids=cur_uids,
+             lora_adapters=self.loras,
+@@ -462,6 +473,8 @@ class LoRAManager:
+             lora_lm_head_module=self.lm_head_module,  # merge into embedding or lora module
+         )
+         if new_uids:
++            from sglang.srt.unique_adapter_audit import loading
++            loading("lora_cpu_to_gpu_batch", [self.lora_refs[u].lora_name for u in new_uids if u is not None], audit_start)
+             changed_slots = {self.memory_pool.uid_to_buffer_id[uid] for uid in new_uids}
+             self._notify_lora_slots_updated(changed_slots)
+ 
+diff --git a/python/sglang/srt/lora/lora_moe_runners.py b/python/sglang/srt/lora/lora_moe_runners.py
+index adddaf10d..10c94f5d5 100644
+--- a/python/sglang/srt/lora/lora_moe_runners.py
++++ b/python/sglang/srt/lora/lora_moe_runners.py
+@@ -185,6 +185,7 @@ class LoRAInfo:
+     cg_buffers: dict | None = None
+ 
+     lora_use_virtual_experts: bool = False
++    gate_up_interleaved: bool = False
+ 
+ 
+ @dataclass
+@@ -336,28 +337,41 @@ def _add_lora_gate_up_delta(
+     if is_gated:
+         inter_size = gate_up_b.shape[2] // 2
+         lora_a_stacked = [gate_up_a[:, :, :r, :], gate_up_a[:, :, r : 2 * r, :]]
+-        lora_b_stacked = [
+-            gate_up_b[:, :, :inter_size, :],
+-            gate_up_b[:, :, inter_size:, :],
+-        ]
++        if lora_info.gate_up_interleaved:
++            lora_b_stacked = [gate_up_b[:, :, 0::2, :], gate_up_b[:, :, 1::2, :]]
++        else:
++            lora_b_stacked = [
++                gate_up_b[:, :, :inter_size, :],
++                gate_up_b[:, :, inter_size:, :],
++            ]
+     else:
+         lora_a_stacked = [gate_up_a]
+         lora_b_stacked = [gate_up_b]
+ 
+     if lora_info.lora_use_virtual_experts:
+-        merged_experts_fused_moe_lora_add(
+-            output=intermediate_cache,
+-            hidden_states=hidden_states,
+-            lora_a=gate_up_a,
+-            lora_b=gate_up_b,
+-            topk_ids=topk_ids,
+-            topk_weights=topk_weights,
+-            token_lora_mapping=token_lora_mapping,
+-            mul_routed_weight=False,
+-            experts_shared_outer_loras_a=lora_info.experts_shared_outer_loras,
+-            experts_shared_outer_loras_b=False,
+-            routing_cache=routing_cache,
+-        )
++        # Independent gate/up A factors cannot be fed to a single rank-r B
++        # expansion: that would silently use only the gate A factor for both.
++        # The fused expansion honors output strides, including even/odd views.
++        for i, (lora_a, lora_b) in enumerate(zip(lora_a_stacked, lora_b_stacked)):
++            if is_gated and lora_info.gate_up_interleaved:
++                output = intermediate_cache[:, :, i::2]
++            elif is_gated:
++                output = intermediate_cache[:, :, i * inter_size : (i + 1) * inter_size]
++            else:
++                output = intermediate_cache
++            merged_experts_fused_moe_lora_add(
++                output=output,
++                hidden_states=hidden_states,
++                lora_a=lora_a,
++                lora_b=lora_b,
++                topk_ids=topk_ids,
++                topk_weights=topk_weights,
++                token_lora_mapping=token_lora_mapping,
++                mul_routed_weight=False,
++                experts_shared_outer_loras_a=lora_info.experts_shared_outer_loras,
++                experts_shared_outer_loras_b=False,
++                routing_cache=routing_cache,
++            )
+     else:
+         blk = _get_moe_lora_block_config(r)
+         fused_moe_lora(
+@@ -387,6 +401,7 @@ def _add_lora_gate_up_delta(
+             expand_num_warps=4,
+             expand_num_stages=2,
+             expand_split_k=1,
++            interleaved_output=is_gated and lora_info.gate_up_interleaved,
+         )
+ 
+ 
+diff --git a/python/sglang/srt/managers/io_struct.py b/python/sglang/srt/managers/io_struct.py
+index 45d6228da..100d0a35e 100644
+--- a/python/sglang/srt/managers/io_struct.py
++++ b/python/sglang/srt/managers/io_struct.py
+@@ -323,6 +323,10 @@ class GenerateReqInput:
+     priority: Optional[int] = None
+     # Extra cache key for caller-defined request classification.
+     extra_key: Optional[Union[List[str], str]] = None
++    # Name of a registered soft prompt (see /load_soft_prompt). The prompt text must contain
++    # the soft-prompt marker (or input_ids a placeholder run); those positions receive the
++    # tenant's learned embeddings and the prefix cache is namespaced by the soft prompt.
++    soft_prompt: Optional[Union[List[Optional[str]], str]] = None
+ 
+     # Whether to disallow logging for this request (e.g. due to ZDR)
+     no_logs: bool = False
+@@ -571,7 +575,7 @@ class GenerateReqInput:
+             self.token_ids_logprob = None
+         if self.return_sampling_mask is None:
+             self.return_sampling_mask = False
+-        for field_name in ("extra_key", "cache_salt"):
++        for field_name in ("extra_key", "cache_salt", "soft_prompt"):
+             value = getattr(self, field_name)
+             if value is not None and not isinstance(value, str):
+                 raise ValueError(
+@@ -608,6 +612,7 @@ class GenerateReqInput:
+         self._normalize_return_hidden_states(num)
+         self._normalize_custom_logit_processor(num)
+         self._normalize_extra_key(num)
++        self._normalize_soft_prompt(num)
+         self._normalize_cache_salt(num)
+         self._normalize_kv_hints(num)
+         self._normalize_bootstrap_params(num)
+@@ -865,6 +870,24 @@ class GenerateReqInput:
+         else:
+             raise ValueError("extra_key should be a list or a string.")
+ 
++    def _normalize_soft_prompt(self, num):
++        """Normalize soft_prompt for batch processing (same shape rules as extra_key)."""
++        if self.soft_prompt is None:
++            return
++        if isinstance(self.soft_prompt, str):
++            self.soft_prompt = [self.soft_prompt or None] * num
++        elif isinstance(self.soft_prompt, list):
++            if len(self.soft_prompt) != self.batch_size:
++                raise ValueError(
++                    "The length of soft_prompt should be equal to the batch size."
++                )
++            if any(v is not None and not isinstance(v, str) for v in self.soft_prompt):
++                raise ValueError("Every soft_prompt should be a string or None.")
++            self.soft_prompt = [v or None for v in self.soft_prompt]
++            self.soft_prompt = self.soft_prompt * self.parallel_sample_num
++        else:
++            raise ValueError("soft_prompt should be a list or a string.")
++
+     def _normalize_cache_salt(self, num):
+         """Normalize cache_salt for batch processing."""
+         if self.cache_salt is None:
+@@ -1036,6 +1059,7 @@ class GenerateReqInput:
+             max_thinking_tokens=self.max_thinking_tokens,
+             priority=self.priority,
+             extra_key=self.extra_key[i] if self.extra_key is not None else None,
++            soft_prompt=self.soft_prompt[i] if self.soft_prompt is not None else None,
+             cache_salt=(self.cache_salt[i] if self.cache_salt is not None else None),
+             kv_hints=(self.kv_hints[i] if self.kv_hints is not None else None),
+             no_logs=self.no_logs,
+@@ -1133,6 +1157,11 @@ class TokenizedGenerateReqInput(BaseReq, kw_only=True):
+ 
+     # Extra cache key for caller-defined request classification.
+     extra_key: Optional[str] = None
++    # Resolved soft prompt: registered name, its version, and the absolute position of the
++    # first placeholder token in input_ids (the run length is the registered prompt length).
++    soft_prompt: Optional[str] = None
++    soft_prompt_version: Optional[int] = None
++    soft_prompt_start: Optional[int] = None
+ 
+     # Whether to disallow logging for this request (e.g. due to ZDR)
+     no_logs: bool = False
+@@ -2564,6 +2593,32 @@ LoadLoRAAdapterReqOutput = UnloadLoRAAdapterReqOutput = (
+ ) = LoRAUpdateOutput
+ 
+ 
++class LoadSoftPromptReqInput(BaseReq, kw_only=True):
++    # Name used by requests (`soft_prompt=<name>`).
++    name: str
++    # Path to a safetensors file holding exactly one tensor of shape [length, hidden_size].
++    path: str
++    # Experiment-only CPU staging; no GPU copy or request registration.
++    cpu_only: bool = False
++    # Assigned by the TokenizerManager; bumps on every (re)load so cached prefixes of an
++    # older prompt with the same name are never reused.
++    version: Optional[int] = None
++
++
++class UnloadSoftPromptReqInput(BaseReq, kw_only=True):
++    name: str
++
++
++class SoftPromptUpdateOutput(BaseReq, kw_only=True):
++    success: bool
++    error_message: Optional[str] = None
++    # name -> prompt length (number of placeholder tokens) for all loaded prompts.
++    loaded: Optional[Dict[str, int]] = None
++
++
++LoadSoftPromptReqOutput = UnloadSoftPromptReqOutput = SoftPromptUpdateOutput
++
++
+ class BlockReqType(Enum):
+     BLOCK = 1
+     UNBLOCK = 2
+diff --git a/python/sglang/srt/managers/schedule_batch.py b/python/sglang/srt/managers/schedule_batch.py
+index 45ff08e36..8aa9390ff 100755
+--- a/python/sglang/srt/managers/schedule_batch.py
++++ b/python/sglang/srt/managers/schedule_batch.py
+@@ -5,6 +5,7 @@ from sglang.srt.model_executor.forward_batch_info import ForwardBatch
+ from sglang.srt.runtime_context import (
+     get_disagg,
+     get_exec,
++    get_lora,
+     get_parallel,
+     get_schedule,
+     get_serving,
+@@ -141,6 +142,10 @@ from sglang.srt.observability.req_time_stats import (
+ from sglang.srt.sampling.sampling_batch_info import SamplingBatchInfo
+ from sglang.srt.sampling.sampling_mask import SamplingMaskRows
+ from sglang.srt.sampling.sampling_params import SamplingParams
++from sglang.srt.soft_prompt.scheduling import (
++    map_soft_prompt_ids_for_model,
++    soft_prompt_extend_overrides,
++)
+ from sglang.srt.utils import flatten_nested_list
+ from sglang.srt.utils.token_sequence_matcher import TokenSequenceMatcher
+ 
+@@ -1137,6 +1142,8 @@ class Req(ReqDllmMixin):
+ 
+         self.extra_key = extra_key
+         self.cache_salt = cache_salt or None
++        # Set by soft_prompt.scheduling.attach_soft_prompt for soft-prompt requests.
++        self.soft_prompt = None
+         self.lora_id = lora_id
+         self.routing_key = routing_key
+ 
+@@ -2773,6 +2780,18 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
+         # Init tensors
+         reqs = self.reqs
+         input_ids = [r.get_fill_ids()[r.prefix_len :] for r in reqs]
++        if any(r.soft_prompt is not None for r in reqs):
++            # Soft-prompt spans carry per-prompt ids (prefix-cache keys); the model gets the
++            # in-vocab placeholder id there and the prompt's embeddings via replace_embeds.
++            placeholder_id = get_lora().soft_prompt_placeholder_id
++            input_ids = [
++                (
++                    map_soft_prompt_ids_for_model(ids, placeholder_id)
++                    if r.soft_prompt is not None
++                    else ids
++                )
++                for r, ids in zip(reqs, input_ids)
++            ]
+         extend_num_tokens = sum(len(ids) for ids in input_ids)
+         seq_lens = [r.extend_end for r in reqs]
+         orig_seq_lens = [max(r.extend_end, len(r.origin_input_ids)) for r in reqs]
+@@ -2875,6 +2894,17 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
+                         req.positional_embed_overrides.embeds[list(indices)]
+                     )
+                     all_replace_positions.extend(positions)
++            if req.soft_prompt is not None:
++                # Placeholder positions inside this extend chunk get the tenant's
++                # embeddings; positions already in the cached prefix need nothing.
++                sp_overrides = soft_prompt_extend_overrides(
++                    req, pre_len, req.extend_len, input_id_pointer
++                )
++                if sp_overrides is not None:
++                    has_replace_embeds = True
++                    sp_embeds, sp_positions = sp_overrides
++                    all_replace_embeds.append(sp_embeds)
++                    all_replace_positions.extend(sp_positions)
+             input_id_pointer += input_id_lens[i]
+ 
+             multimodal_inputs.append(req.multimodal_inputs)
+@@ -2968,8 +2998,10 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
+             extend_input_logprob_token_ids = None
+ 
+         if has_replace_embeds:
+-            replace_embeds_tensor = torch.cat(all_replace_embeds, dim=0).to(
+-                self.device, non_blocking=True
++            # Soft-prompt rows already live on the device; other overrides may be on CPU.
++            replace_embeds_tensor = torch.cat(
++                [e.to(self.device, non_blocking=True) for e in all_replace_embeds],
++                dim=0,
+             )
+             replace_positions_tensor = torch.tensor(
+                 all_replace_positions, dtype=torch.long, device=self.device
+@@ -3605,6 +3637,10 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
+         # Decode embeds the last output token via embed_tokens; clear the stale
+         # prefill-time tensor so it doesn't leak into ForwardBatch.
+         self.input_embeds = None
++        # Embedding overrides apply to extend tokens only. Leaving them set would make every
++        # later decode step of this batch skip the decode CUDA graph (it refuses overrides).
++        self.replace_embeds = None
++        self.replace_positions = None
+ 
+         self.mamba_cow_src_indices = None
+         self.mamba_cow_dst_indices = None
+diff --git a/python/sglang/srt/managers/scheduler.py b/python/sglang/srt/managers/scheduler.py
+index 0d0ec41b6..b6498a4df 100644
+--- a/python/sglang/srt/managers/scheduler.py
++++ b/python/sglang/srt/managers/scheduler.py
+@@ -159,6 +159,7 @@ from sglang.srt.managers.io_struct import (
+     LoadLoRAAdapterFromTensorsReqOutput,
+     LoadLoRAAdapterReqInput,
+     LoadLoRAAdapterReqOutput,
++    LoadSoftPromptReqInput,
+     MMInputsProcessError,
+     OpenSessionReqInput,
+     PauseGenerationReqInput,
+@@ -178,10 +179,12 @@ from sglang.srt.managers.io_struct import (
+     ShutdownReq,
+     SlowDownReqInput,
+     SlowDownReqOutput,
++    SoftPromptUpdateOutput,
+     TokenizedEmbeddingReqInput,
+     TokenizedGenerateReqInput,
+     UnloadLoRAAdapterReqInput,
+     UnloadLoRAAdapterReqOutput,
++    UnloadSoftPromptReqInput,
+     UpdateWeightFromDiskReqInput,
+     UpdateWeightsFromDistributedReqInput,
+     UpdateWeightsFromIPCReqInput,
+@@ -327,6 +330,8 @@ from sglang.srt.rust_server.server import RustServer
+ from sglang.srt.sampling.sampling_batch_info import SamplingBatchInfo
+ from sglang.srt.server_args import PortArgs, ServerArgs
+ from sglang.srt.session.session_controller import SessionController
++from sglang.srt.soft_prompt.pool import get_soft_prompt_pool, read_soft_prompt_tensor
++from sglang.srt.soft_prompt.scheduling import attach_soft_prompt
+ from sglang.srt.speculative.base_spec_worker import BaseSpecWorker
+ from sglang.srt.speculative.dflash_utils import validate_dflash_request
+ from sglang.srt.speculative.eagle_utils import (
+@@ -1851,6 +1856,8 @@ class Scheduler(
+                     self.load_lora_adapter_from_tensors,
+                 ),
+                 (UnloadLoRAAdapterReqInput, self.unload_lora_adapter),
++                (LoadSoftPromptReqInput, self.load_soft_prompt),
++                (UnloadSoftPromptReqInput, self.unload_soft_prompt),
+                 (PauseGenerationReqInput, self.pause_generation),
+                 (ContinueGenerationReqInput, self.continue_generation),
+                 (ConfigureLoggingReq, self.configure_logging),
+@@ -2943,6 +2950,8 @@ class Scheduler(
+                 token_indices_to_pool=recv_req.token_indices_to_pool,
+             )
+             req.tokenizer = self.tokenizer
++            if recv_req.soft_prompt is not None:
++                attach_soft_prompt(req, recv_req)
+ 
+             if radix_native_session:
+                 req.session_generation = self.tree_cache.ensure_session_generation(
+@@ -5898,6 +5907,48 @@ class Scheduler(
+             )
+         return result
+ 
++    def load_soft_prompt(
++        self, recv_req: LoadSoftPromptReqInput
++    ) -> SoftPromptUpdateOutput:
++        """Load (or reload in place) a tenant soft prompt into the GPU pool."""
++        try:
++            pool = get_soft_prompt_pool()
++            if pool is None:
++                raise ValueError("soft prompt pool is not initialized")
++            import time
++            from sglang.srt.unique_adapter_audit import loading
++            started = time.monotonic_ns()
++            if not hasattr(pool, "cpu_staged"):
++                pool.cpu_staged = {}
++            if recv_req.cpu_only:
++                # Clone materializes the mmap-backed safetensor in CPU RAM.
++                pool.cpu_staged[recv_req.name] = read_soft_prompt_tensor(recv_req.path).clone()
++                get_parallel().tp_group.barrier()
++                return SoftPromptUpdateOutput(rid=recv_req.rid, success=True, loaded={recv_req.name: pool.cpu_staged[recv_req.name].shape[0]})
++            tensor = pool.cpu_staged.pop(recv_req.name, None)
++            if tensor is None:
++                tensor = read_soft_prompt_tensor(recv_req.path)
++            pool.load(recv_req.name, tensor, recv_req.version or 0)
++            loading("sp_cpu_to_gpu", recv_req.name, started)
++            if os.environ.get("UNIQUE_ADAPTER_RESIDENT") == "1":
++                torch.cuda.synchronize()
++                get_parallel().tp_group.barrier()
++            return SoftPromptUpdateOutput(rid=recv_req.rid, success=True, loaded=pool.loaded())
++        except Exception as e:  # report to the caller instead of killing the scheduler
++            return SoftPromptUpdateOutput(rid=recv_req.rid, success=False, error_message=str(e))
++
++    def unload_soft_prompt(
++        self, recv_req: UnloadSoftPromptReqInput
++    ) -> SoftPromptUpdateOutput:
++        try:
++            pool = get_soft_prompt_pool()
++            if pool is None:
++                raise ValueError("soft prompt pool is not initialized")
++            pool.unload(recv_req.name)
++            return SoftPromptUpdateOutput(rid=recv_req.rid, success=True, loaded=pool.loaded())
++        except Exception as e:
++            return SoftPromptUpdateOutput(rid=recv_req.rid, success=False, error_message=str(e))
++
+     def load_lora_adapter_from_tensors(
+         self, recv_req: LoadLoRAAdapterFromTensorsReqInput
+     ) -> LoadLoRAAdapterFromTensorsReqOutput:
+diff --git a/python/sglang/srt/managers/scheduler_components/batch_result_processor.py b/python/sglang/srt/managers/scheduler_components/batch_result_processor.py
+index 928e3cb41..123d1f042 100644
+--- a/python/sglang/srt/managers/scheduler_components/batch_result_processor.py
++++ b/python/sglang/srt/managers/scheduler_components/batch_result_processor.py
+@@ -14,6 +14,7 @@ from typing import (
+ 
+ import numpy as np
+ import torch
++from sglang.srt.unique_adapter_audit import token as audit_unique_token
+ 
+ from sglang.srt.disaggregation.utils import DisaggregationMode
+ from sglang.srt.environ import envs
+@@ -363,6 +364,7 @@ class SchedulerBatchResultProcessor:
+                     else:
+                         # req output_ids are set here
+                         req.output_ids.append(next_token_id)
++                        audit_unique_token(req)
+ 
+                         self._maybe_update_reasoning_tokens(req, next_token_id)
+ 
+@@ -1034,6 +1036,7 @@ class SchedulerBatchResultProcessor:
+                 new_accept_len = 0
+             else:
+                 req.output_ids.extend(next_token_id)
++                audit_unique_token(req)
+                 new_accept_len = len(next_token_id)
+                 self._maybe_update_reasoning_tokens(req, next_token_id)
+             req.update_finish_state(new_accept_len)
+diff --git a/python/sglang/srt/managers/tokenizer_control_mixin.py b/python/sglang/srt/managers/tokenizer_control_mixin.py
+index f62afbae8..4e7e1ec51 100644
+--- a/python/sglang/srt/managers/tokenizer_control_mixin.py
++++ b/python/sglang/srt/managers/tokenizer_control_mixin.py
+@@ -3,6 +3,7 @@ from __future__ import annotations
+ import asyncio
+ import hashlib
+ import logging
++import os
+ import time
+ import uuid
+ from typing import TYPE_CHECKING, Any, Dict, List, Optional, Tuple
+@@ -51,6 +52,7 @@ from sglang.srt.managers.io_struct import (
+     LoadLoRAAdapterFromTensorsReqOutput,
+     LoadLoRAAdapterReqInput,
+     LoadLoRAAdapterReqOutput,
++    LoadSoftPromptReqInput,
+     LoRAUpdateOutput,
+     OpenSessionReqInput,
+     PdRoleSwitchReqInput,
+@@ -71,8 +73,10 @@ from sglang.srt.managers.io_struct import (
+     SetInternalStateReqOutput,
+     SlowDownReqInput,
+     SlowDownReqOutput,
++    SoftPromptUpdateOutput,
+     UnloadLoRAAdapterReqInput,
+     UnloadLoRAAdapterReqOutput,
++    UnloadSoftPromptReqInput,
+     UpdateWeightsFromDistributedReqInput,
+     UpdateWeightsFromDistributedReqOutput,
+     UpdateWeightsFromIPCReqInput,
+@@ -138,6 +142,7 @@ _COMMUNICATOR_SPECS = [
+     ("begin_weight_update", BeginWeightUpdateReqOutput),
+     ("end_weight_update", EndWeightUpdateReqOutput),
+     ("update_lora_adapter", LoRAUpdateOutput),
++    ("update_soft_prompt", SoftPromptUpdateOutput),
+     ("dumper_control", DumperControlReqOutput),
+     ("scale_elastic_ep", ScaleElasticEPReqOutput),
+ ]
+@@ -184,7 +189,11 @@ class TokenizerControlMixin:
+         for spec in _COMMUNICATOR_SPECS:
+             name, resp_type = spec[0], spec[1]
+             mode = spec[2] if len(spec) > 2 else "queueing"
+-            comm = FanOutCommunicator(
++            communicator = FanOutCommunicator
++            if name == "update_soft_prompt" and os.environ.get("UNIQUE_ADAPTER_SP_CONCURRENT_UPDATES") == "1":
++                from sglang.srt.soft_prompt.control import PromptUpdateCommunicator
++                communicator = PromptUpdateCommunicator
++            comm = communicator(
+                 self._dispatch_to_scheduler,
+                 get_parallel().num_dp_ranks,
+                 mode,
+@@ -824,6 +833,84 @@ class TokenizerControlMixin:
+                 error_message=str(e),
+             )
+ 
++    def _soft_prompt_update_lock_for(self, name):
++        if os.environ.get("UNIQUE_ADAPTER_SP_CONCURRENT_UPDATES") != "1":
++            return self.soft_prompt_update_lock
++        from sglang.srt.soft_prompt.control import PromptNameLocks
++        if not hasattr(self, "_soft_prompt_name_locks"):
++            self._soft_prompt_name_locks = PromptNameLocks()
++        return self._soft_prompt_name_locks.get(name)
++
++    async def load_soft_prompt(
++        self: TokenizerManager,
++        obj: LoadSoftPromptReqInput,
++        _: Optional[fastapi.Request] = None,
++    ) -> SoftPromptUpdateOutput:
++        self.auto_create_handle_loop()
++        try:
++            if not get_lora().enable_soft_prompt:
++                raise ValueError(
++                    "Soft prompts are not enabled. Please set `--enable-soft-prompt`."
++                )
++            if get_parallel().dp_size != 1:
++                raise ValueError(
++                    "data-parallel replicas are not supported for soft prompts"
++                )
++            from sglang.srt.soft_prompt.control import audit_update
++            update_started = time.monotonic_ns()
++            async with self._soft_prompt_update_lock_for(obj.name):
++                update_acquired = time.monotonic_ns()
++                obj.version = self.soft_prompt_next_version
++                self.soft_prompt_next_version += 1
++                results = await self.update_soft_prompt_communicator(obj)
++                audit_update(obj.name, "load" if isinstance(obj, LoadSoftPromptReqInput) else "unload",
++                             update_started, update_acquired)
++                failed = [r for r in results if not r.success]
++                if failed:
++                    return failed[0]
++                if obj.cpu_only and os.environ.get("UNIQUE_ADAPTER_REGISTERED") != "1":
++                    return results[0]
++                length = results[0].loaded[obj.name]
++                self.soft_prompt_registry[obj.name] = (length, obj.version)
++                logger.info(
++                    "Loaded soft prompt %s (length=%d, version=%d) from %s",
++                    obj.name,
++                    length,
++                    obj.version,
++                    obj.path,
++                )
++                return results[0]
++        except ValueError as e:
++            return SoftPromptUpdateOutput(success=False, error_message=str(e))
++
++    async def unload_soft_prompt(
++        self: TokenizerManager,
++        obj: UnloadSoftPromptReqInput,
++        _: Optional[fastapi.Request] = None,
++    ) -> SoftPromptUpdateOutput:
++        self.auto_create_handle_loop()
++        try:
++            if not get_lora().enable_soft_prompt:
++                raise ValueError(
++                    "Soft prompts are not enabled. Please set `--enable-soft-prompt`."
++                )
++            from sglang.srt.soft_prompt.control import audit_update
++            update_started = time.monotonic_ns()
++            async with self._soft_prompt_update_lock_for(obj.name):
++                update_acquired = time.monotonic_ns()
++                if obj.name not in self.soft_prompt_registry:
++                    raise ValueError(f"soft prompt {obj.name!r} is not loaded")
++                # Stop admitting new requests first. Known limitation: a request already
++                # tokenized against this prompt but not yet prefilled fails at prefill.
++                del self.soft_prompt_registry[obj.name]
++                results = await self.update_soft_prompt_communicator(obj)
++                audit_update(obj.name, "load" if isinstance(obj, LoadSoftPromptReqInput) else "unload",
++                             update_started, update_acquired)
++                failed = [r for r in results if not r.success]
++                return failed[0] if failed else results[0]
++        except ValueError as e:
++            return SoftPromptUpdateOutput(success=False, error_message=str(e))
++
+     async def unload_lora_adapter(
+         self: TokenizerManager,
+         obj: UnloadLoRAAdapterReqInput,
+diff --git a/python/sglang/srt/managers/tokenizer_manager.py b/python/sglang/srt/managers/tokenizer_manager.py
+index e8e4b450f..f99f32194 100644
+--- a/python/sglang/srt/managers/tokenizer_manager.py
++++ b/python/sglang/srt/managers/tokenizer_manager.py
+@@ -175,6 +175,13 @@ from sglang.srt.server_args import (
+     PortArgs,
+     ServerArgs,
+ )
++from sglang.srt.soft_prompt.utils import (
++    SOFT_PROMPT_LOGIT_BIAS,
++    SOFT_PROMPT_MARKER,
++    parse_soft_prompt_paths,
++    soft_prompt_length,
++    soft_prompt_token_ids,
++)
+ from sglang.srt.utils import (
+     configure_gc_warning,
+     freeze_gc,
+@@ -786,6 +793,15 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
+         # Please note that, unlike `model_update_lock`, this does not block inference, allowing
+         # LoRA updates and inference to overlap.
+         self.lora_update_lock = asyncio.Lock()
++        # Soft prompts: name -> (length, version). Every (re)load gets a unique version
++        # (startup prompts 1..k in --soft-prompt-paths order, matching the pool), which
++        # selects the prompt's per-prompt token ids and hence its prefix-cache keys.
++        self.soft_prompt_registry: Dict[str, Tuple[int, int]] = {}
++        self.soft_prompt_update_lock = asyncio.Lock()
++        startup_prompts = parse_soft_prompt_paths(get_lora().soft_prompt_paths)
++        for version, (name, path) in enumerate(startup_prompts, start=1):
++            self.soft_prompt_registry[name] = (soft_prompt_length(path), version)
++        self.soft_prompt_next_version = len(startup_prompts) + 1
+         # A cache for mapping the lora_name for LoRA adapters that have been loaded at any
+         # point to their latest LoRARef objects, so that they can be
+         # dynamically loaded if needed for inference
+@@ -1282,10 +1298,89 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
+         else:
+             mm_inputs = None
+ 
++        soft_prompt_meta = None
++        if isinstance(obj, GenerateReqInput) and obj.soft_prompt is not None:
++            input_ids, soft_prompt_meta = self._resolve_soft_prompt(
++                obj, input_text, input_ids, input_embeds, mm_inputs
++            )
++
+         self._validate_one_request(obj, input_ids)
+-        return self._create_tokenized_object(
++        if soft_prompt_meta is not None:
++            # After validation (which requires in-vocab ids): give the soft-prompt run its
++            # per-prompt ids so the prefix cache keys it by prompt and version.
++            _, sp_version, sp_start = soft_prompt_meta
++            sp_length = self.soft_prompt_registry[obj.soft_prompt][0]
++            input_ids = (
++                list(input_ids[:sp_start])
++                + soft_prompt_token_ids(
++                    sp_version, sp_length, get_lora().max_soft_prompt_len
++                )
++                + list(input_ids[sp_start + sp_length :])
++            )
++        tokenized_obj = self._create_tokenized_object(
+             obj, input_text, input_ids, input_embeds, mm_inputs, token_type_ids
+         )
++        if soft_prompt_meta is not None:
++            (
++                tokenized_obj.soft_prompt,
++                tokenized_obj.soft_prompt_version,
++                tokenized_obj.soft_prompt_start,
++            ) = soft_prompt_meta
++        return tokenized_obj
++
++    def _resolve_soft_prompt(
++        self: TokenizerManager, obj, input_text, input_ids, input_embeds, mm_inputs
++    ):
++        """Place the placeholder run for ``obj.soft_prompt`` and return (input_ids, meta).
++
++        Text prompts mark the position with SOFT_PROMPT_MARKER (exactly once); token-id
++        prompts must already contain one contiguous run of the placeholder id whose length
++        equals the registered prompt length.
++        """
++        lora_args = get_lora()
++        if not lora_args.enable_soft_prompt:
++            raise ValueError(
++                "soft_prompt was given but soft prompts are disabled; launch with --enable-soft-prompt."
++            )
++        if input_embeds is not None or mm_inputs is not None:
++            raise ValueError(
++                "soft_prompt cannot be combined with input_embeds or multimodal inputs."
++            )
++        name = obj.soft_prompt
++        if name not in self.soft_prompt_registry:
++            raise ValueError(f"soft prompt {name!r} is not loaded.")
++        length, version = self.soft_prompt_registry[name]
++        placeholder = lora_args.soft_prompt_placeholder_id
++
++        if obj.input_ids is None and input_text is not None:
++            if input_text.count(SOFT_PROMPT_MARKER) != 1:
++                raise ValueError(
++                    f"a text prompt with soft_prompt must contain {SOFT_PROMPT_MARKER!r} exactly once."
++                )
++            pre, post = input_text.split(SOFT_PROMPT_MARKER)
++            input_ids = (
++                (self.tokenizer.encode(pre) if pre else [])
++                + [placeholder] * length
++                + self.tokenizer.encode(post, add_special_tokens=False)
++            )
++        positions = [i for i, t in enumerate(input_ids) if t == placeholder]
++        if not positions:
++            raise ValueError(
++                f"input_ids for soft prompt {name!r} contain no placeholder id {placeholder}."
++            )
++        start = positions[0]
++        if positions != list(range(start, start + length)):
++            raise ValueError(
++                f"soft prompt {name!r} needs exactly one contiguous run of {length} placeholder ids."
++            )
++
++        # The placeholder id is input-only: never let it be sampled.
++        sampling_params = dict(obj.sampling_params or {})
++        logit_bias = dict(sampling_params.get("logit_bias") or {})
++        logit_bias[str(placeholder)] = SOFT_PROMPT_LOGIT_BIAS
++        sampling_params["logit_bias"] = logit_bias
++        obj.sampling_params = sampling_params
++        return input_ids, (name, version, start)
+ 
+     @staticmethod
+     def _normalize_mm_content_hashes(obj: GenerateReqInput) -> None:
+diff --git a/python/sglang/srt/model_executor/forward_batch_info.py b/python/sglang/srt/model_executor/forward_batch_info.py
+index 0f10d5f2a..6bb20f5d5 100644
+--- a/python/sglang/srt/model_executor/forward_batch_info.py
++++ b/python/sglang/srt/model_executor/forward_batch_info.py
+@@ -1050,8 +1050,16 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
+             encoder_lens=batch.encoder_lens,
+             encoder_out_cache_loc=batch.encoder_out_cache_loc,
+             input_embeds=batch.input_embeds,
+-            replace_embeds=batch.replace_embeds,
+-            replace_positions=batch.replace_positions,
++            # Embedding overrides index the target's extend tokens. Draft models see a
++            # different token layout (EAGLE rotates ids left by one; DFlash feeds its own
++            # input_embeds), so they do not inherit them; EAGLE re-adds them rotated in
++            # _draft_extend_for_prefill.
++            replace_embeds=(
++                None if model_runner.is_draft_worker else batch.replace_embeds
++            ),
++            replace_positions=(
++                None if model_runner.is_draft_worker else batch.replace_positions
++            ),
+             # Scalar config / flags
+             return_logprob=batch.return_logprob,
+             is_extend_in_batch=batch.is_extend_in_batch,
+diff --git a/python/sglang/srt/model_executor/model_runner.py b/python/sglang/srt/model_executor/model_runner.py
+index e1c12af64..ce380fbe9 100644
+--- a/python/sglang/srt/model_executor/model_runner.py
++++ b/python/sglang/srt/model_executor/model_runner.py
+@@ -724,6 +724,7 @@ class ModelRunner:
+         )
+         self.maybe_apply_post_load_model_transforms()
+         self.maybe_init_lora_manager()
++        self.maybe_init_soft_prompt_pool()
+         self.maybe_enable_batch_invariant_mode()
+         self.configure_kv_cache_dtype()
+ 
+@@ -814,6 +815,39 @@ class ModelRunner:
+         if get_parallel().tp_size > 1 and supports_torch_tp:
+             self.apply_torch_tp()
+ 
++    def maybe_init_soft_prompt_pool(self):
++        """Allocate the multi-tenant soft-prompt pool (before KV sizing) and load startup prompts."""
++        from sglang.srt.soft_prompt.pool import (
++            SoftPromptPool,
++            read_soft_prompt_tensor,
++            set_soft_prompt_pool,
++        )
++        from sglang.srt.soft_prompt.utils import parse_soft_prompt_paths
++
++        lora_args = get_lora()
++        if not lora_args.enable_soft_prompt:
++            return
++        if lora_args.soft_prompt_placeholder_id is None:
++            raise ValueError(
++                "--enable-soft-prompt requires --soft-prompt-placeholder-id"
++            )
++        if self.is_draft_worker:
++            return  # the draft model reads token ids only; the pool belongs to the target
++        weight = self.model.get_input_embeddings().weight
++        pool = SoftPromptPool(
++            max_prompts=lora_args.max_soft_prompts,
++            max_len=lora_args.max_soft_prompt_len,
++            hidden_size=weight.shape[-1],
++            dtype=weight.dtype,
++            device=weight.device,
++        )
++        startup_prompts = parse_soft_prompt_paths(lora_args.soft_prompt_paths)
++        # Versions 1..k in argument order, matching the tokenizer-side registry.
++        for version, (name, path) in enumerate(startup_prompts, start=1):
++            pool.load(name, read_soft_prompt_tensor(path), version=version)
++            logger.info("Loaded soft prompt %s from %s", name, path)
++        set_soft_prompt_pool(pool)
++
+     def maybe_init_lora_manager(self):
+         if self.spec_algorithm.is_uno():
+             from sglang.srt.speculative.uno_lora import init_uno_lora_manager
+diff --git a/python/sglang/srt/model_executor/pool_configurator.py b/python/sglang/srt/model_executor/pool_configurator.py
+index bebd8277d..f954c01ab 100644
+--- a/python/sglang/srt/model_executor/pool_configurator.py
++++ b/python/sglang/srt/model_executor/pool_configurator.py
+@@ -8,6 +8,8 @@ from available GPU memory using a unified coeff+bias model:
+ 
+ from __future__ import annotations
+ 
++import os
++
+ import logging
+ from bisect import bisect_right
+ from dataclasses import dataclass
+@@ -1638,7 +1640,11 @@ def create_memory_pool_configurator(
+     if is_deepseek_v4(kvc.model_config.hf_config) and kvc.is_hybrid_swa:
+         return DSV4PoolConfigurator(kvc)
+     if kvc.is_hybrid_swa:
+-        if SWARequestCapPoolConfigurator.is_applicable(kvc):
++        explicit_benchmark_ratio = (
++            os.environ.get("UNIQUE_ADAPTER_REGISTERED") == "1"
++            and get_schedule()._swa_full_tokens_ratio_explicitly_set
++        )
++        if not explicit_benchmark_ratio and SWARequestCapPoolConfigurator.is_applicable(kvc):
+             return SWARequestCapPoolConfigurator(kvc)
+         return HybridSWAPoolConfigurator(kvc)
+     # Future: MambaPoolConfigurator
+diff --git a/python/sglang/srt/model_executor/runner/prefill_cuda_graph_runner.py b/python/sglang/srt/model_executor/runner/prefill_cuda_graph_runner.py
+index 7209bd003..f0e025b48 100644
+--- a/python/sglang/srt/model_executor/runner/prefill_cuda_graph_runner.py
++++ b/python/sglang/srt/model_executor/runner/prefill_cuda_graph_runner.py
+@@ -41,6 +41,7 @@ import copy
+ import dataclasses
+ import inspect
+ import logging
++import os
+ from collections.abc import Sequence
+ from contextlib import contextmanager, nullcontext
+ from dataclasses import dataclass
+@@ -132,6 +133,7 @@ from sglang.srt.model_loader.utils import resolve_language_model
+ from sglang.srt.runtime_context import (
+     get_exec,
+     get_flags,
++    get_lora,
+     get_memory,
+     get_parallel,
+     get_schedule,
+@@ -399,6 +401,15 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
+         self._use_draft_input_embeds = (
+             is_breakable_eagle_draft and model_runner.spec_algorithm.is_eagle3()
+         )
++        self._use_sp_input_embeds = (
++            get_lora().enable_soft_prompt
++            and os.environ.get("UNIQUE_ADAPTER_SP_PREFILL_GRAPH") == "1"
++        )
++        if self._use_sp_input_embeds:
++            assert self.prefill_backend_name == Backend.BREAKABLE
++            assert model_runner.model_config.hf_config.model_type == "gpt_oss"
++            assert get_parallel().dp_size == 1 and self.pp_size == 1
++            assert model_runner.spec_algorithm.is_none()
+         if is_breakable_eagle_draft:
+             self.capture_hidden_mode = CaptureHiddenMode.LAST
+         elif (is_eagle and not model_runner.is_draft_worker) or (
+@@ -426,7 +437,7 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
+             hidden_size=input_embeds_hidden_size,
+             dtype=self.model_runner.dtype,
+             enable_mamba_track=self.mamba_track_enabled,
+-            enable_input_embeds=(self.is_multimodal or self._use_draft_input_embeds),
++            enable_input_embeds=(self.is_multimodal or self._use_draft_input_embeds or self._use_sp_input_embeds),
+             pp_size=self.pp_size,
+             is_first_pp_rank=self.model_runner.pp_group.is_first_rank,
+             hc_hidden_size=getattr(
+@@ -461,7 +472,7 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
+             require_gathered_buffer=require_gathered_buffer(),
+             enable_prefill_cp=(is_dsa_enable_prefill_cp() or is_mla_cp_enabled()),
+             attn_tp_sharded_fn=self.model_runner.attn_tp_sequence_sharded,
+-            register_input_embeds=(self.is_multimodal or self._use_draft_input_embeds),
++            register_input_embeds=(self.is_multimodal or self._use_draft_input_embeds or self._use_sp_input_embeds),
+             source=self.buffers,
+         )
+ 
+@@ -1327,9 +1338,12 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
+             return False
+         if is_mixed and getattr(self, "prefer_eager_mixed_prefill", False):
+             return False
+-        if input_embeds is not None:
++        # The opt-in GPT-OSS SP path captures a stable embedding input slot.
++        # ModelRunner composes live text/prompt embeddings; replay copies that
++        # tensor into the captured slot, including on subsequent plain chunks.
++        if input_embeds is not None and not self._use_sp_input_embeds:
+             return False
+-        if replace_embeds is not None:
++        if replace_embeds is not None and not self._use_sp_input_embeds:
+             return False
+         # Off CUDA, BCG takes the MHA companion, whose prefix path is
+         # uncapturable. DSA is exempt: it stays on sparse MLA under BCG.
+diff --git a/python/sglang/srt/soft_prompt/__init__.py b/python/sglang/srt/soft_prompt/__init__.py
+new file mode 100644
+index 000000000..e69de29bb
+diff --git a/python/sglang/srt/soft_prompt/control.py b/python/sglang/srt/soft_prompt/control.py
+new file mode 100644
+index 000000000..e9ee8abbd
+--- /dev/null
++++ b/python/sglang/srt/soft_prompt/control.py
+@@ -0,0 +1,72 @@
++"""Correlated prompt updates: independent names need not wait a decode round.
++
++Same-name ordering is still protected by a per-name lock in the tokenizer.
++Cancelled callers cannot consume another update's reply.
++"""
++import asyncio
++import atexit
++import json
++import os
++import time
++import uuid
++import weakref
++
++_audit_file = None
++
++
++def audit_update(name, operation, start_ns, acquired_ns):
++    global _audit_file
++    prefix = os.environ.get("UNIQUE_ADAPTER_AUDIT")
++    if not prefix or os.environ.get("UNIQUE_ADAPTER_SP_PROFILE") != "1":
++        return
++    if _audit_file is None:
++        _audit_file = open(prefix + ".sp-control.jsonl", "a", buffering=1)
++        atexit.register(_audit_file.close)
++    _audit_file.write(json.dumps(dict(name=name, operation=operation,
++        start_ns=start_ns, acquired_ns=acquired_ns, reply_ns=time.monotonic_ns())) + "\n")
++
++
++class PromptUpdateCommunicator:
++    def __init__(self, send, fan_out, mode="queueing"):
++        self._send = send
++        self._fan_out = fan_out
++        self._pending = {}
++
++    def set_fan_out(self, count):
++        self._fan_out = count
++
++    async def __call__(self, obj):
++        rid = "sp-update-" + uuid.uuid4().hex
++        obj.rid = rid
++        future = asyncio.get_running_loop().create_future()
++        self._pending[rid] = (future, [], self._fan_out)
++        try:
++            self._send(obj)
++            return await future
++        finally:
++            self._pending.pop(rid, None)
++
++    def handle_recv(self, obj):
++        pending = self._pending.get(obj.rid)
++        if pending is None:
++            return
++        future, replies, count = pending
++        if future.done():
++            return
++        replies.append(obj)
++        if len(replies) == count:
++            future.set_result(replies)
++
++
++class PromptNameLocks:
++    def __init__(self):
++        self._locks = weakref.WeakValueDictionary()
++
++    def get(self, name):
++        # No await: obtaining a strong reference and inserting are atomic with
++        # respect to other tasks on the tokenizer's event loop.
++        lock = self._locks.get(name)
++        if lock is None:
++            lock = asyncio.Lock()
++            self._locks[name] = lock
++        return lock
+diff --git a/python/sglang/srt/soft_prompt/pool.py b/python/sglang/srt/soft_prompt/pool.py
+new file mode 100644
+index 000000000..86d7e90f0
+--- /dev/null
++++ b/python/sglang/srt/soft_prompt/pool.py
+@@ -0,0 +1,151 @@
++"""GPU-resident pool of multi-tenant soft prompts.
++
++A soft prompt is a learned ``[length, hidden_size]`` tensor that replaces the input
++embeddings of a contiguous run of placeholder tokens. Prompts are input-only: they never
++touch the LM head or the vocabulary, so each tenant costs ``length * hidden_size`` elements.
++
++The pool is a flat ``[max_prompts * max_len, hidden_size]`` buffer; slot ``s`` owns rows
++``[s * max_len, s * max_len + length)``. Every (re)load bumps a version that is folded into
++the request's prefix-cache key, so cached KV computed from an older tensor is never reused.
++"""
++
++from __future__ import annotations
++
++import logging
++from dataclasses import dataclass
++from typing import Dict, List, Optional, Sequence
++
++import torch
++from safetensors.torch import load_file
++
++logger = logging.getLogger(__name__)
++
++
++@dataclass
++class SoftPromptEntry:
++    slot: int
++    length: int
++    version: int
++
++
++def read_soft_prompt_tensor(path: str) -> torch.Tensor:
++    tensors = load_file(path, device="cpu")
++    if len(tensors) != 1:
++        raise ValueError(
++            f"soft prompt file {path} must hold exactly one tensor, found {sorted(tensors)}"
++        )
++    tensor = next(iter(tensors.values()))
++    if tensor.ndim != 2:
++        raise ValueError(
++            f"soft prompt tensor in {path} must be [length, hidden_size], got {tuple(tensor.shape)}"
++        )
++    return tensor
++
++
++class SoftPromptPool:
++    def __init__(
++        self,
++        max_prompts: int,
++        max_len: int,
++        hidden_size: int,
++        dtype: torch.dtype,
++        device: torch.device,
++    ):
++        if max_prompts <= 0 or max_len <= 0:
++            raise ValueError(
++                "max_soft_prompts and max_soft_prompt_len must be positive"
++            )
++        self.max_prompts = max_prompts
++        self.max_len = max_len
++        self.hidden_size = hidden_size
++        self.dtype = dtype
++        self.device = device
++        self.buffer = torch.zeros(
++            max_prompts * max_len, hidden_size, dtype=dtype, device=device
++        )
++        self.entries: Dict[str, SoftPromptEntry] = {}
++        self.free_slots: List[int] = list(range(max_prompts))
++        logger.info(
++            "Soft prompt pool: %d slots x %d tokens x %d hidden (%.1f MiB, %s)",
++            max_prompts,
++            max_len,
++            hidden_size,
++            self.buffer.numel() * self.buffer.element_size() / 2**20,
++            dtype,
++        )
++
++    def load(self, name: str, tensor: torch.Tensor, version: int) -> SoftPromptEntry:
++        length, hidden = tensor.shape
++        if hidden != self.hidden_size:
++            raise ValueError(
++                f"soft prompt {name!r} hidden size {hidden} != model hidden size {self.hidden_size}"
++            )
++        if not 0 < length <= self.max_len:
++            raise ValueError(
++                f"soft prompt {name!r} length {length} must be in [1, {self.max_len}]"
++            )
++        entry = self.entries.get(name)
++        if entry is not None:
++            slot = entry.slot  # reload in place
++        elif self.free_slots:
++            slot = self.free_slots.pop(0)
++        else:
++            raise ValueError(
++                f"soft prompt pool is full ({self.max_prompts} prompts); unload one first"
++            )
++        start = slot * self.max_len
++        # Same cast as exporting the prompt into an embedding table of the model dtype.
++        self.buffer[start : start + length].copy_(
++            tensor.to(device=self.device, dtype=self.dtype)
++        )
++        entry = SoftPromptEntry(slot=slot, length=length, version=version)
++        self.entries[name] = entry
++        return entry
++
++    def unload(self, name: str) -> None:
++        entry = self.entries.pop(name, None)
++        if entry is None:
++            raise ValueError(f"soft prompt {name!r} is not loaded")
++        self.free_slots.append(entry.slot)
++
++    def loaded(self) -> Dict[str, int]:
++        return {name: e.length for name, e in self.entries.items()}
++
++    def gather(
++        self, name: str, version: Optional[int], offsets: Sequence[int]
++    ) -> torch.Tensor:
++        """Embedding rows for prompt-relative offsets, shape [len(offsets), hidden]."""
++        entry = self.entries.get(name)
++        if entry is None:
++            raise ValueError(
++                f"soft prompt {name!r} was unloaded while a request using it was in flight"
++            )
++        if version is not None and entry.version != version:
++            # The prompt was reloaded after tokenization. The request's cache key carries the
++            # old version, so nothing is shared incorrectly; it simply runs on the new tensor.
++            logger.warning(
++                "soft prompt %r reloaded (v%s -> v%s) while a request was pending",
++                name,
++                version,
++                entry.version,
++            )
++        if any(not 0 <= o < entry.length for o in offsets):
++            raise ValueError(f"soft prompt {name!r} offset out of range")
++        rows = torch.tensor(
++            [entry.slot * self.max_len + o for o in offsets],
++            dtype=torch.long,
++            device=self.device,
++        )
++        return self.buffer.index_select(0, rows)
++
++
++_POOL: Optional[SoftPromptPool] = None
++
++
++def set_soft_prompt_pool(pool: Optional[SoftPromptPool]) -> None:
++    global _POOL
++    _POOL = pool
++
++
++def get_soft_prompt_pool() -> Optional[SoftPromptPool]:
++    return _POOL
+diff --git a/python/sglang/srt/soft_prompt/scheduling.py b/python/sglang/srt/soft_prompt/scheduling.py
+new file mode 100644
+index 000000000..631378ddc
+--- /dev/null
++++ b/python/sglang/srt/soft_prompt/scheduling.py
+@@ -0,0 +1,81 @@
++"""Scheduler-side soft-prompt handling: attach to a Req and emit prefill overrides."""
++
++from __future__ import annotations
++
++import os
++import time
++from array import array
++from dataclasses import dataclass
++from typing import List, Optional, Tuple
++
++import torch
++
++from sglang.srt.soft_prompt.pool import get_soft_prompt_pool
++from sglang.srt.soft_prompt.utils import is_soft_prompt_id
++
++
++@dataclass(frozen=True)
++class SoftPromptRef:
++    name: str
++    version: Optional[int]
++    start: int  # absolute position of the first placeholder token
++    length: int
++
++
++def attach_soft_prompt(req, recv_req) -> None:
++    """Record the request's soft prompt (pool reference and placeholder span).
++
++    Prefix-cache isolation needs no extra key: the soft-prompt span already carries
++    per-prompt, per-version token ids (see soft_prompt.utils.SOFT_PROMPT_ID_BASE), so the
++    radix tree diverges exactly where the soft prompt starts and tokens before it stay
++    shareable across tenants.
++    """
++    pool = get_soft_prompt_pool()
++    entry = pool.entries.get(recv_req.soft_prompt) if pool is not None else None
++    if (entry is None and pool is not None
++            and os.environ.get("UNIQUE_ADAPTER_REGISTERED") == "1"):
++        staged = getattr(pool, "cpu_staged", {})
++        tensor = staged.pop(recv_req.soft_prompt, None)
++        if tensor is not None:
++            from sglang.srt.unique_adapter_audit import loading
++            started = time.monotonic_ns()
++            entry = pool.load(recv_req.soft_prompt, tensor, recv_req.soft_prompt_version)
++            loading("sp_cpu_to_gpu", recv_req.soft_prompt, started)
++    if entry is None:
++        req.set_finish_with_abort(
++            f"soft prompt {recv_req.soft_prompt!r} is not loaded on this worker"
++        )
++        return
++    req.soft_prompt = SoftPromptRef(
++        name=recv_req.soft_prompt,
++        version=recv_req.soft_prompt_version,
++        start=recv_req.soft_prompt_start,
++        length=entry.length,
++    )
++
++
++def soft_prompt_extend_overrides(
++    req, pre_len: int, extend_len: int, flat_offset: int
++) -> Optional[Tuple[torch.Tensor, List[int]]]:
++    """Embeddings and flat extend-batch positions for the placeholders in this chunk.
++
++    ``pre_len`` is the cached-prefix length, ``extend_len`` the number of tokens computed
++    now, and ``flat_offset`` where this request's tokens start in the flattened batch.
++    """
++    ref: SoftPromptRef = req.soft_prompt
++    lo = max(ref.start, pre_len)
++    hi = min(ref.start + ref.length, pre_len + extend_len)
++    if lo >= hi:
++        return None
++    offsets = list(range(lo - ref.start, hi - ref.start))
++    positions = [flat_offset + (p - pre_len) for p in range(lo, hi)]
++    embeds = get_soft_prompt_pool().gather(ref.name, ref.version, offsets)
++    return embeds, positions
++
++
++def map_soft_prompt_ids_for_model(token_ids, placeholder_id: int):
++    """Replace per-prompt soft-prompt ids (outside the vocabulary) by the placeholder id."""
++    if not any(is_soft_prompt_id(t) for t in token_ids):
++        return token_ids
++    mapped = [placeholder_id if is_soft_prompt_id(t) else t for t in token_ids]
++    return array("q", mapped) if isinstance(token_ids, array) else mapped
+diff --git a/python/sglang/srt/soft_prompt/utils.py b/python/sglang/srt/soft_prompt/utils.py
+new file mode 100644
+index 000000000..17db8adaa
+--- /dev/null
++++ b/python/sglang/srt/soft_prompt/utils.py
+@@ -0,0 +1,68 @@
++"""Helpers shared by the tokenizer (CPU) and model-runner (GPU) sides of soft prompts."""
++
++from __future__ import annotations
++
++from typing import List, Optional, Tuple
++
++from safetensors import safe_open
++
++# Text marker replaced by the placeholder-id run of the request's soft prompt.
++SOFT_PROMPT_MARKER = "<|soft_prompt|>"
++# Logit bias that keeps the input-only placeholder id from ever being sampled.
++SOFT_PROMPT_LOGIT_BIAS = -1.0e4
++# Soft-prompt positions are stored in a request's token ids as per-prompt ids outside the
++# vocabulary (like multimodal pad values), so the prefix cache keys them per prompt and
++# version while tokens before the soft prompt stay shareable across tenants. The model
++# never sees these ids: they are mapped back to the placeholder id when building its input.
++# Range: above multimodal pad values ([1e6, 1e6 + 2**30)) and below int32 max.
++SOFT_PROMPT_ID_BASE = 1_200_000_000
++SOFT_PROMPT_ID_LIMIT = 2**31 - 1
++
++
++def soft_prompt_token_ids(version: int, length: int, max_len: int) -> List[int]:
++    """Per-prompt token ids for one (re)load of a soft prompt."""
++    start = SOFT_PROMPT_ID_BASE + version * max_len
++    if start + length > SOFT_PROMPT_ID_LIMIT:
++        raise ValueError(
++            "soft prompt id space exhausted; restart the server to reset versions"
++        )
++    return list(range(start, start + length))
++
++
++def is_soft_prompt_id(token_id: int) -> bool:
++    return token_id >= SOFT_PROMPT_ID_BASE
++
++
++def parse_soft_prompt_paths(paths: Optional[List[str]]) -> List[Tuple[str, str]]:
++    parsed = []
++    for item in paths or []:
++        if "=" not in item:
++            raise ValueError(
++                f"--soft-prompt-paths entries must be NAME=PATH, got {item!r}"
++            )
++        name, path = item.split("=", 1)
++        if not name or not path:
++            raise ValueError(
++                f"--soft-prompt-paths entries must be NAME=PATH, got {item!r}"
++            )
++        parsed.append((name, path))
++    names = [n for n, _ in parsed]
++    if len(set(names)) != len(names):
++        raise ValueError("--soft-prompt-paths has duplicate names")
++    return parsed
++
++
++def soft_prompt_length(path: str) -> int:
++    """Prompt length read from the safetensors header (no tensor data is loaded)."""
++    with safe_open(path, framework="pt") as f:
++        keys = list(f.keys())
++        if len(keys) != 1:
++            raise ValueError(
++                f"soft prompt file {path} must hold exactly one tensor, found {keys}"
++            )
++        shape = f.get_slice(keys[0]).get_shape()
++    if len(shape) != 2:
++        raise ValueError(
++            f"soft prompt tensor in {path} must be [length, hidden_size], got {shape}"
++        )
++    return int(shape[0])
+diff --git a/python/sglang/srt/speculative/eagle_utils.py b/python/sglang/srt/speculative/eagle_utils.py
+index 149b7e56c..392235ef4 100644
+--- a/python/sglang/srt/speculative/eagle_utils.py
++++ b/python/sglang/srt/speculative/eagle_utils.py
+@@ -1,5 +1,6 @@
+ from __future__ import annotations
+ 
++import itertools
+ import logging
+ import math
+ from enum import IntEnum
+@@ -91,6 +92,24 @@ def per_step_draft_out_cache_loc(
+     )
+ 
+ 
++def _rotate_replace_embeds_for_draft(replace_embeds, replace_positions, extend_lens):
++    """Shift flat extend-batch embedding overrides left by one token within each request.
++
++    EAGLE draft-extend reads each request's ids rotated left by one, so an override at
++    target position p belongs to draft position p - 1; one on a request's first extend
++    token has no draft position and is dropped.
++    """
++    starts = torch.tensor(
++        [0] + list(itertools.accumulate(extend_lens))[:-1],
++        device=replace_positions.device,
++        dtype=replace_positions.dtype,
++    )
++    keep = ~torch.isin(replace_positions, starts)
++    if not bool(keep.any()):
++        return None, None
++    return replace_embeds[keep], replace_positions[keep] - 1
++
++
+ def _eagle_prefill_tail_tokens(
+     batch: ScheduleBatch, next_token_ids: torch.Tensor
+ ) -> torch.Tensor:
+diff --git a/python/sglang/srt/speculative/eagle_worker_v2.py b/python/sglang/srt/speculative/eagle_worker_v2.py
+index a91fca469..3daa1347b 100644
+--- a/python/sglang/srt/speculative/eagle_worker_v2.py
++++ b/python/sglang/srt/speculative/eagle_worker_v2.py
+@@ -92,6 +92,7 @@ from sglang.srt.speculative.eagle_info import (
+ )
+ from sglang.srt.speculative.eagle_utils import (
+     _eagle_prefill_tail_tokens,
++    _rotate_replace_embeds_for_draft,
+     default_tree_mask_mode,
+     get_draft_recurrent_hidden_state_spec,
+     organize_draft_results,
+@@ -980,6 +981,15 @@ class EagleDraftWorker(EagleDraftWorkerBase):
+         forward_batch.return_logprob = False
+         if mm_input_embeds is not None:
+             forward_batch.mm_input_embeds = mm_input_embeds
++        if batch.replace_embeds is not None and not batch.forward_mode.is_idle():
++            # The draft shares the target's embedding table, so embedding overrides such as
++            # soft prompts apply to it too, at positions rotated like its input ids.
++            (
++                forward_batch.replace_embeds,
++                forward_batch.replace_positions,
++            ) = _rotate_replace_embeds_for_draft(
++                batch.replace_embeds, batch.replace_positions, batch.extend_lens
++            )
+ 
+         # Seed the first draft-decode loop from each request's last prefill
+         # position. Gather last-per-req before the copy (prefill can be long).
+diff --git a/python/sglang/srt/unique_adapter_audit.py b/python/sglang/srt/unique_adapter_audit.py
+new file mode 100644
+index 000000000..9f227ecbb
+--- /dev/null
++++ b/python/sglang/srt/unique_adapter_audit.py
+@@ -0,0 +1,50 @@
++"""Opt-in serving experiment audit; disabled unless UNIQUE_ADAPTER_AUDIT is set.
++
++Binary token records: little-endian monotonic_ns:uint64, numeric request ID:uint32,
++cumulative committed output tokens:uint32. Records are made after the existing
++GPU->CPU synchronization, never inferred from HTTP chunk boundaries.
++"""
++import atexit
++import json
++import os
++import struct
++import time
++
++_path = os.environ.get("UNIQUE_ADAPTER_AUDIT")
++_tokens = None
++_loads = None
++_last_flush = 0
++
++
++def tp_rank():
++    from sglang.srt.runtime_context import get_parallel
++    return get_parallel().tp_rank
++
++
++def token(req):
++    global _tokens, _last_flush
++    if not _path or not req.rid.startswith("ub-"):
++        return
++    if tp_rank() != 0:
++        return
++    if _tokens is None:
++        _tokens = open(_path + ".tokens.bin", "ab", buffering=1024 * 1024)
++        atexit.register(_tokens.close)
++    now = time.monotonic_ns()
++    _tokens.write(struct.pack("<QII", now, int(req.rid[3:]), len(req.output_ids)))
++    if now - _last_flush > 1_000_000_000 or len(req.output_ids) >= req.sampling_params.max_new_tokens:
++        _tokens.flush()
++        _last_flush = now
++
++
++def loading(kind, name, start_ns, **details):
++    global _loads
++    if not _path:
++        return
++    rank = tp_rank()
++    if _loads is None:
++        suffix = ".loads.jsonl" if rank == 0 else f".tp{rank}.loads.jsonl"
++        _loads = open(_path + suffix, "a", buffering=1)
++        atexit.register(_loads.close)
++    _loads.write(json.dumps(dict(kind=kind, name=name, start_ns=start_ns,
++                                 end_ns=time.monotonic_ns(), tp_rank=rank, **details)) + "\n")
+diff --git a/python/sglang/srt/unique_adapter_cpu_store.py b/python/sglang/srt/unique_adapter_cpu_store.py
+new file mode 100644
+index 000000000..b4469fd29
+--- /dev/null
++++ b/python/sglang/srt/unique_adapter_cpu_store.py
+@@ -0,0 +1,59 @@
++"""Experiment-only, same-host immutable CPU tensor store shared across TP ranks.
++
++The owner is a CPU helper in the serving job's allocation. Its sealed memfd contains fully
++materialized weights; mapping it does not read checkpoint data from storage.
++"""
++import json
++import mmap
++import os
++from pathlib import Path
++import socket
++
++_stores = {}
++
++
++def weights(adapter_path):
++    import torch
++
++    index_path = os.environ.get("UNIQUE_ADAPTER_CPU_STORE")
++    dynamic = os.environ.get("UNIQUE_ADAPTER_DYNAMIC_STORE") == "1"
++    if dynamic:
++        if index_path:
++            raise ValueError("Static and dynamic CPU stores cannot both be enabled")
++        index_path = str(Path(adapter_path) / "cpu-store-index.json")
++    if not index_path:
++        return None
++    if dynamic or index_path not in _stores:
++        index = json.loads(Path(index_path).read_text())
++        if index["hostname"] != socket.gethostname():
++            raise ValueError("CPU tensor store must be on the serving node")
++        if not index["sealed"] or not index["ready"]:
++            raise ValueError("CPU tensor store is not immutable and ready")
++        if dynamic:
++            # the store must have been written by this Slurm allocation
++            owner = os.environ.get("SLURM_JOB_ID")
++            if not owner or index["owner_job"] != owner:
++                raise ValueError("Dynamic CPU store must belong to the serving allocation")
++        fd = os.open(index["memfd_path"], os.O_RDONLY)
++        try:
++            if os.fstat(fd).st_size != index["bytes"]:
++                raise ValueError("CPU tensor store size mismatch")
++            # Private mapping retains shared physical pages on reads. It also
++            # protects the shared store if a caller accidentally writes a view.
++            mapping = mmap.mmap(fd, 0, access=mmap.ACCESS_COPY)
++        finally:
++            os.close(fd)
++        if not dynamic:
++            _stores[index_path] = index, mapping
++    if not dynamic:
++        index, mapping = _stores[index_path]
++    # Dynamic mappings are owned only by the tensor buffers. Unloading an
++    # adapter drops those references; no global cache retains past requests.
++    item = index["adapters"][str(Path(adapter_path).resolve())]
++    tensors = {}
++    for spec in index["layout"]:
++        tensor = torch.frombuffer(mapping, dtype=torch.bfloat16,
++                                  count=spec["numel"],
++                                  offset=item["offset"] + spec["offset"])
++        tensors[spec["name"]] = tensor.reshape(spec["shape"])
++    return tensors

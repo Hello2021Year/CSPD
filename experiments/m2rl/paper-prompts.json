@@ -1,0 +1,18 @@
+{
+  "M": {
+    "url": "https://huggingface.co/datasets/ucsbai/cspd/resolve/1a934d8f732f5e8ec5a7686f8b3adaa3fdee4d47/prompts/m2rl/M.pt",
+    "sha256": "e69db00ec5dcbeb912662fd4f126bc592cd3f56134862ebbb5c42cb3f65acc33"
+  },
+  "C": {
+    "url": "https://huggingface.co/datasets/ucsbai/cspd/resolve/1a934d8f732f5e8ec5a7686f8b3adaa3fdee4d47/prompts/m2rl/C.pt",
+    "sha256": "40ee711c2164103d13b1db52230a4e8aafdfab4969e01a28f711f585ac605439"
+  },
+  "S": {
+    "url": "https://huggingface.co/datasets/ucsbai/cspd/resolve/1a934d8f732f5e8ec5a7686f8b3adaa3fdee4d47/prompts/m2rl/S.pt",
+    "sha256": "ebfae348a654b109d3a6916da44de6f6844aa796eb9d6b017e6cd8cc4af13849"
+  },
+  "I": {
+    "url": "https://huggingface.co/datasets/ucsbai/cspd/resolve/1a934d8f732f5e8ec5a7686f8b3adaa3fdee4d47/prompts/m2rl/I.pt",
+    "sha256": "4df48b31ea66df683a165c9ded9a650eaf2b4cdca57f3bf6b3af0776de866bf5"
+  }
+}

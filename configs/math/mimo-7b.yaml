@@ -1,0 +1,100 @@
+# MiMo-7B-SFT -> first MiMo-7B-RL release.
+schema_version: 1
+name: mimo-7b-sft-to-rl-sp256-q4-cap2-2ep-lr0p01-constant
+# Xiaomi's fixed 130K RL prompt artifact is unpublished. At the user's request,
+# use the public DeepScaleR prompt pool as an explicit cross-pair substitute.
+task: mimo_math_deepscaler
+models:
+  student: XiaomiMiMo/MiMo-7B-SFT
+  teacher: XiaomiMiMo/MiMo-7B-RL
+  trust_remote_code:
+    student: true
+    teacher: true
+template:
+  source: teacher
+  system:
+    mode: empty
+  user:
+    field: problem
+    prefix: "<|soft_prompt|>"
+    suffix: ""
+  add_generation_prompt: true
+data:
+  sampling:
+    num_prompts: 8192
+  evaluation:
+    aime_2024:
+      num_prompts: all
+    aime_2025:
+      num_prompts: all
+    math_500:
+      num_prompts: all
+sampling:
+  trajectory_filter: correct_only
+  generation:
+    temperature: 1.0
+    top_p: 1.0
+    max_new_tokens: 32768
+    samples_per_prompt: 4
+    provenance: "user-selected cross-pair sampling data; 8192 prompts from agentica-org/DeepScaleR-Preview-Dataset x 4 requests; MiMo's fixed 130K RL pool remains unpublished"
+distillation:
+  objective: response_sft
+  attention_implementation: flash_attention_2
+  activation_checkpointing: true
+  checkpoint_every_updates: 20
+  prompt_length: 256
+  max_sequence_length: 40000
+  overlength_policy: filter
+  max_trajectories_per_question: 2
+  prompt_init:
+    method: sampled_vocabulary
+  insertion:
+    mode: placeholder
+    marker: "<|soft_prompt|>"
+    sentinel_id: -200
+    occurrence: exactly_one
+  optimizer: adamw
+  learning_rate: 0.01
+  schedule:
+    name: constant
+    warmup_steps: 0
+    min_lr_ratio: 1.0
+  effective_batch_size: 128
+  micro_batch_size: 1
+  cross_entropy_backend: liger_fused
+  loss_normalization: sequence
+  batch_seed: 42
+  epochs: 2
+  weight_decay: 0.0
+  max_grad_norm: 10.0
+evaluation:
+  arms:
+    student:
+      generation:
+        temperature: 0.6
+        top_p: 0.95
+        max_new_tokens: 32768
+        samples_per_prompt: 32
+        provenance: MiMo official T=0.6 and AIME avg@32; top_p=0.95 and max=32768 are local choices; runtime caps each request to the remaining model context after its prompt
+    teacher:
+      generation:
+        temperature: 0.6
+        top_p: 0.95
+        max_new_tokens: 32768
+        samples_per_prompt: 32
+        provenance: MiMo official T=0.6 and AIME avg@32; top_p=0.95 and max=32768 are local choices; runtime caps each request to the remaining model context after its prompt
+    student_soft_prompt:
+      generation:
+        temperature: 0.6
+        top_p: 0.95
+        max_new_tokens: 32768
+        samples_per_prompt: 32
+        provenance: MiMo official T=0.6 and AIME avg@32; top_p=0.95 and max=32768 are local choices; runtime caps each request to the remaining model context after its prompt
+  benchmarks:
+    math_500:
+      generation:
+        temperature: 0.6
+        top_p: 0.95
+        max_new_tokens: 32768
+        samples_per_prompt: 4
+        provenance: local MATH-500 avg@4 policy; only T=0.6 is upstream-confirmed, while top_p=0.95, max=32768, and n=4 are disclosed local choices; runtime caps each request to the remaining model context after its prompt

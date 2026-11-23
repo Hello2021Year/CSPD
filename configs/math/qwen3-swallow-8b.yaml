@@ -1,0 +1,106 @@
+# Qwen3-Swallow 8B dense SFT -> RLVR full-data two-epoch run.
+schema_version: 1
+name: qwen3-swallow-8b-dense-sft-to-rlvr-sp256-q4-cap2-lr0p01-2ep
+task: dolci_think_math
+
+models:
+  student: tokyotech-llm/Qwen3-Swallow-8B-SFT-v0.2
+  teacher: tokyotech-llm/Qwen3-Swallow-8B-RL-v0.2
+
+template:
+  source: teacher
+  system:
+    mode: model_default
+  user:
+    field: problem
+    prefix: "<|soft_prompt|>"
+    suffix: ""
+  add_generation_prompt: true
+
+data:
+  sampling:
+    num_prompts: 8192
+  evaluation:
+    aime_2024:
+      num_prompts: all
+    aime_2025:
+      num_prompts: all
+    math_500:
+      num_prompts: all
+
+sampling:
+  trajectory_filter: correct_only
+  generation:
+    temperature: 1.0
+    top_p: 1.0
+    max_new_tokens: 32768
+    samples_per_prompt: 4
+    provenance: default teacher sampling; all available unique verified prompts from the first 8192 Dolci-Think-RL-7B math rows x 4 requests
+
+distillation:
+  objective: response_sft
+  attention_implementation: flash_attention_2
+  activation_checkpointing: true
+  checkpoint_every_updates: 20
+  prompt_length: 256
+  max_sequence_length: 40000
+  overlength_policy: filter
+  max_trajectories_per_question: 2
+  prompt_init:
+    method: sampled_vocabulary
+    seed: 42
+  insertion:
+    mode: placeholder
+    marker: "<|soft_prompt|>"
+    sentinel_id: -200
+    occurrence: exactly_one
+  optimizer: adamw
+  learning_rate: 0.01
+  schedule:
+    name: constant
+    warmup_steps: 0
+    min_lr_ratio: 1.0
+  effective_batch_size: 128
+  micro_batch_size: 1
+  cross_entropy_backend: liger_fused
+  loss_normalization: sequence
+  batch_seed: 42
+  epochs: 2
+  weight_decay: 0.0
+  max_grad_norm: 10.0
+
+evaluation:
+  arms:
+    student:
+      generation:
+        temperature: 0.6
+        top_p: 0.95
+        top_k: 20
+        max_new_tokens: 32768
+        samples_per_prompt: 32
+        provenance: Swallow recommended T=0.6/top_p=0.95/top_k=20 with local max=32768 and size-tier avg@32 for AIME
+    teacher:
+      generation:
+        temperature: 0.6
+        top_p: 0.95
+        top_k: 20
+        max_new_tokens: 32768
+        samples_per_prompt: 32
+        provenance: Swallow recommended T=0.6/top_p=0.95/top_k=20 with local max=32768 and size-tier avg@32 for AIME
+    student_soft_prompt:
+      generation:
+        temperature: 0.6
+        top_p: 0.95
+        top_k: 20
+        max_new_tokens: 32768
+        samples_per_prompt: 32
+        provenance: Swallow recommended T=0.6/top_p=0.95/top_k=20 with local max=32768 and size-tier avg@32 for AIME
+  benchmarks:
+    math_500:
+      generation:
+        temperature: 0.6
+        top_p: 0.95
+        top_k: 20
+        max_new_tokens: 32768
+        samples_per_prompt: 4
+        provenance: Swallow recommended decoding with local max=32768 and size-tier avg@4 for 500 questions

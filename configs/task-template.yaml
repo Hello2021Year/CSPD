@@ -1,0 +1,304 @@
+# Annotated experiment-config template.
+#
+# This file contains only user-editable experiment inputs. Dataset locations are
+# defined by the selected task adapter. Model/dataset revisions, downloaded-file
+# hashes, tokenizer identity, template hash, resolved defaults, and the code
+# commit are detected at runtime and written to stage manifests.
+
+# Required. Only schema version 1 is currently supported.
+schema_version: 1
+
+# Required. Human-readable run/config name; use a new name for a materially
+# different experiment recipe.
+name: example-off-policy-soft-prompt-distillation
+
+# Required. Registry key from src/soft_prompt_distillation/tasks/__init__.py.
+# The task defines dataset repos/files/splits, row normalization, and grader.
+task: replace-with-task-adapter-name
+
+models:
+  # Required Hugging Face repo names. The current algorithm requires identical
+  # student/teacher token-to-ID vocabularies. Runtime records resolved revisions.
+  student: example/student-sft
+  teacher: example/teacher-rl
+
+# One shared template is used for teacher sampling, distillation, and all three
+# evaluation arms. There are no per-stage templates.
+template:
+  # Required. Which model supplies the live chat_template.
+  # Options: student | teacher
+  source: teacher
+
+  system:
+    # Required. Options:
+    #   model_default - do not add an explicit system message
+    #   empty         - add an empty system message
+    #   text          - add the exact `text` below
+    mode: text
+
+    # Required only when mode=text; remove it for model_default or empty.
+    # The marker may instead be placed in user.prefix or user.suffix, but it
+    # must occur exactly once across template-owned text.
+    text: "<|soft_prompt|>Replace with the task system prompt."
+
+  user:
+    # Required. Canonical normalized-row field containing the question.
+    # Task adapters in this repo normalize questions to `problem`.
+    field: problem
+
+    # Required strings; empty is allowed. These wrap the question text.
+    prefix: ""
+    suffix: ""
+
+  # Required boolean. Usually true for causal-LM generation.
+  add_generation_prompt: true
+
+  # Optional mapping of scalar kwargs forwarded to tokenizer.apply_chat_template,
+  # for example a Qwen/MiMo thinking-mode switch. Reserved call arguments cannot
+  # be overridden.
+  # chat_template_kwargs:
+  #   enable_thinking: true
+
+  # Optional string; default empty. Appended after the rendered generation
+  # header and included in prompt token IDs, for recipes such as AceReason's
+  # explicit `<think>\n` assistant prefix.
+  # assistant_prefix: "<think>\n"
+
+# Dataset sources are owned by the task adapter. This section selects how many
+# rows this experiment consumes. Evaluation keys must match aliases exposed by
+# the selected task, for example aime_2024 for deepscaler_math.
+data:
+  sampling:
+    # Required. Positive integer | all. The literal all keeps every row; -1 is
+    # invalid. With all, selection_seed controls ordering only.
+    num_prompts: all
+
+    # Optional integer; default: 42. Controls deterministic selection/order.
+    # selection_seed: 42
+
+  evaluation:
+    replace-with-task-eval-alias:
+      # Required. Positive integer | all.
+      num_prompts: all
+
+      # Optional integer; default: 42.
+      # selection_seed: 42
+
+sampling:
+  # Optional; default: correct_only.
+  # Options:
+  #   correct_only - keep only trajectories accepted by the task grader
+  #   all          - keep every nonempty/schema-valid generated trajectory
+  # The trainer consumes the frozen snapshot and does not filter it again.
+  # trajectory_filter: correct_only
+
+  generation:
+    # These defaults are written explicitly so this example remains entirely
+    # block-style YAML. A concrete experiment may override any field.
+
+    # Float in [0, 2]. Zero selects greedy decoding.
+    temperature: 1.0
+
+    # Float in (0, 1]. Used when temperature > 0.
+    top_p: 1.0
+
+    # Positive integer; maximum generated response tokens per trajectory.
+    max_new_tokens: 32000
+
+    # Positive integer; independent teacher trajectories per selected question.
+    samples_per_prompt: 1
+
+    # Optional block sequences. EOS is always included automatically; these add
+    # model-specific stop token IDs or stop strings.
+    # stop_token_ids:
+    #   - 151645
+    # stop_strings:
+    #   - "</final>"
+
+    # Optional nonempty note such as a paper/model-card reference. It is saved
+    # in the manifest but does not affect execution.
+    # provenance: DeepScaleR model card
+
+distillation:
+  # Required. Currently supported option: response_sft.
+  # It computes causal cross-entropy only on assistant response tokens.
+  objective: response_sft
+
+  # Optional; default: sdpa. Training-only attention backend. Options:
+  # eager | sdpa | flash_attention_2 | flex_attention. FlashAttention-2
+  # requires its CUDA extension. FlexAttention requires a recent PyTorch /
+  # Triton runtime and preserves model-specific attention modifications such
+  # as GPT-OSS learned sinks when Transformers implements them.
+  attention_implementation: flash_attention_2
+
+  # Optional boolean; default: false. Recompute frozen-transformer activations
+  # during backward to reduce memory. This trades extra compute for memory.
+  activation_checkpointing: true
+
+  # Optional positive integer or null; default: null. Save immutable prompt-only
+  # checkpoints after this many optimizer updates. The final update is always saved.
+  checkpoint_every_updates: 10
+
+  # Required positive integer. Number of learned virtual prompt embeddings.
+  prompt_length: 128
+
+  # Optional positive integer; default: null (no explicit training limit).
+  # Total length is prompt tokens + response tokens + learned soft tokens.
+  max_sequence_length: 65536
+
+  # Optional; default: error. Options: error | filter. With filter, overlength
+  # trajectories are excluded before update scheduling and model loading.
+  overlength_policy: filter
+
+  # Optional positive integer; default: null. After length filtering, retain at
+  # most this many sampled teacher trajectories for each question_id.
+  max_trajectories_per_question: 1
+
+  prompt_init:
+    # Required. Options:
+    #   gaussian          - sample N(0, std^2); requires std
+    #   sampled_vocabulary - copy deterministic non-special student embedding rows;
+    #                        std must be omitted
+    method: gaussian
+
+    # Optional integer; default: 42.
+    # seed: 42
+
+    # Required positive finite number only for gaussian. A sensible starting
+    # point is the student's config.initializer_range; it is 0.02 for the
+    # current DeepSeek/DeepScaleR 1.5B pair.
+    std: 0.02
+
+  insertion:
+    # These four fields are required invariants of the current implementation;
+    # normally do not change them. `marker` must occur exactly once in the
+    # shared template, is removed before model input, and is never added to the
+    # tokenizer vocabulary.
+    mode: placeholder              # only supported option: placeholder
+    marker: "<|soft_prompt|>"
+    sentinel_id: -200              # any negative out-of-vocabulary control ID
+    occurrence: exactly_one        # only supported option: exactly_one
+
+  # Required. Only supported optimizer: adamw. It owns only the prompt tensor.
+  optimizer: adamw
+
+  # Required positive finite float. This is the peak/base prompt learning rate.
+  learning_rate: 0.003
+
+  schedule:
+    # Required. Options: constant | cosine
+    name: cosine
+
+    # Required nonnegative integer. Linear warmup reaches learning_rate on this
+    # update. Use 0 to disable warmup. It must not exceed the resolved total
+    # updates; with epochs this is checked after loading the snapshot.
+    warmup_steps: 10
+
+    # Required float in [0, 1]. Final LR / base LR for cosine.
+    # For constant schedule this must be exactly 1.0.
+    min_lr_ratio: 0.0
+
+  # Required positive integer. Global number of trajectories contributing to
+  # one optimizer update across all torchrun ranks.
+  # Required positive integer. Training always uses drop_last=true: an
+  # incomplete global batch at each epoch tail is discarded. For multi-GPU
+  # training this value must also be divisible by the torchrun world size.
+  effective_batch_size: 32
+
+  # Optional positive integer; default: 1. Maximum trajectories in one
+  # forward/backward call on each rank. Smaller values use gradient
+  # accumulation and reduce memory without changing the global objective.
+  micro_batch_size: 1
+
+  # Optional: torch | liger_fused; default: torch. liger_fused computes the
+  # exact LM-head cross entropy in chunks without materializing full logits.
+  # It requires the train extra's pinned liger-kernel dependency.
+  # cross_entropy_backend: liger_fused
+
+  # Optional integer; default: 42. Controls deterministic epoch shuffling.
+  # batch_seed: 42
+
+  # Required stopping rule: declare exactly one of epochs or max_steps.
+  # One epoch means one update for every accepted trajectory in the frozen
+  # snapshot. The manifest records the resolved total update count.
+  epochs: 1
+  # max_steps: 100
+
+  # Required nonnegative finite float. 0.0 disables decoupled weight decay;
+  # positive values decay only the trainable soft-prompt embeddings.
+  weight_decay: 0.0
+
+  # Required. null disables clipping; otherwise use a positive finite float.
+  max_grad_norm: null
+
+evaluation:
+  # Evaluation always uses SGLang. All arms use token-ID requests. Before
+  # evaluation, export the trained prompt as virtual tokens in a derived student
+  # checkpoint. Set GPU count at launch with
+  # --sglang-tp-size/--sglang-dp-size, request chunking with
+  # --sglang-batch-size, and logs with --sglang-log-level. Runtime topology is
+  # intentionally not stored here.
+  # Exactly these three arms are required. All use the shared template.
+  arms:
+    student:
+      # Student and student_soft_prompt must have exactly equal generation
+      # recipes. Validation rejects any drift between the expanded blocks.
+      generation:
+        # Evaluation generation fields have no defaults and are all required.
+        # temperature: float in [0, 2]; 0 means greedy.
+        temperature: 0.0
+        # top_p: float in (0, 1]; ignored by execution when temperature=0.
+        top_p: 1.0
+        # Optional: -1 disables top-k filtering; otherwise a positive integer.
+        # top_k: -1
+        # Optional positive float; 1.0 disables repetition penalty.
+        # repetition_penalty: 1.0
+        # Positive integer.
+        max_new_tokens: 32000
+        # Positive integer; may be greater than 1 for avg@k evaluation.
+        samples_per_prompt: 1
+        # Optional nonempty documentation note.
+        # provenance: official student evaluation recipe
+
+    teacher:
+      # Teacher may use a different declared decoding recipe. For a strictly
+      # generation-matched comparison, copy the student recipe instead.
+      generation:
+        temperature: 0.0
+        top_p: 1.0
+        # top_k: -1
+        # repetition_penalty: 1.0
+        max_new_tokens: 32000
+        samples_per_prompt: 1
+        # provenance: official teacher evaluation recipe
+
+    student_soft_prompt:
+      # Required to equal the student recipe exactly.
+      generation:
+        # Evaluation generation fields have no defaults and are all required.
+        # temperature: float in [0, 2]; 0 means greedy.
+        temperature: 0.0
+        # top_p: float in (0, 1]; ignored by execution when temperature=0.
+        top_p: 1.0
+        # top_k: -1
+        # repetition_penalty: 1.0
+        # Positive integer.
+        max_new_tokens: 32000
+        # Positive integer; may be greater than 1 for avg@k evaluation.
+        samples_per_prompt: 1
+        # Optional nonempty documentation note.
+        # provenance: official student evaluation recipe
+
+  # Optional per-benchmark generation overrides applied equally to all three
+  # arms. Keys must also exist under data.evaluation. This supports, for
+  # example, AIME avg@64 and MATH-500 avg@5 in the same evaluation run.
+  # benchmarks:
+  #   replace-with-task-eval-alias:
+  #     generation:
+  #       temperature: 0.6
+  #       top_p: 0.95
+  #       top_k: 20
+  #       repetition_penalty: 1.05
+  #       max_new_tokens: 32000
+  #       samples_per_prompt: 5
+  #       provenance: official benchmark-specific recipe

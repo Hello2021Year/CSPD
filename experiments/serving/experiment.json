@@ -1,0 +1,31 @@
+{
+  "model_repo": "lmsys/gpt-oss-20b-bf16",
+  "model_revision": "8de8d3dfa4da071323322a4a3049612203a3b1eb",
+  "model_family": "gpt_oss",
+  "weight_dtype": "bfloat16",
+  "tp_size": 4,
+  "assets": "assets-current",
+  "placeholder_id": 200018,
+  "attention_backend": "triton",
+  "moe_runner_backend": "triton",
+  "gpu_budget_gib": 179,
+  "mem_fraction_static": 0.7,
+  "target_modules": [
+    "q_proj",
+    "k_proj",
+    "v_proj",
+    "o_proj",
+    "gate_proj",
+    "up_proj",
+    "down_proj"
+  ],
+  "expert_lora_format": "independent_per_expert",
+  "exclude_modules": [
+    "router",
+    "embedding",
+    "lm_head"
+  ],
+  "slo_ttft_s": 2.0,
+  "slo_tpot_s": 0.1,
+  "capacity_min_joint_slo_fraction": 0.95
+}

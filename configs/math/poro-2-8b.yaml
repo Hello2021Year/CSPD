@@ -1,0 +1,96 @@
+# Poro-2 8B Long Math Reasoning SFT -> RL Preview.
+# Lower-LR token-normalized retry after the LR 0.01 sequence-loss run collapsed.
+schema_version: 1
+name: poro-2-8b-math-sft-to-rl-sp256-q4-cap2-2ep-lr0p003-token-constant
+task: poro_math
+models:
+  student: LumiOpen/Llama-Poro-2-8B-Long-Math-Reasoning-SFT-Preview
+  teacher: LumiOpen/Llama-Poro-2-8B-Long-Math-Reasoning-RL-Preview
+template:
+  source: teacher
+  system:
+    mode: model_default
+  user:
+    field: problem
+    prefix: "<|soft_prompt|>"
+    suffix: ""
+  add_generation_prompt: true
+data:
+  sampling:
+    num_prompts: 8192
+  evaluation:
+    math_500:
+      num_prompts: all
+    aime_2025:
+      num_prompts: all
+    aime_2026:
+      num_prompts: all
+sampling:
+  trajectory_filter: correct_only
+  generation:
+    temperature: 1.0
+    top_p: 1.0
+    max_new_tokens: 32768
+    samples_per_prompt: 4
+    provenance: "default teacher sampling; 8192 KlearReasoner-MathSub-30K prompts x 4 requests"
+distillation:
+  objective: response_sft
+  attention_implementation: flash_attention_2
+  activation_checkpointing: true
+  checkpoint_every_updates: 20
+  prompt_length: 256
+  max_sequence_length: 40000
+  overlength_policy: filter
+  max_trajectories_per_question: 2
+  prompt_init:
+    method: sampled_vocabulary
+  insertion:
+    mode: placeholder
+    marker: "<|soft_prompt|>"
+    sentinel_id: -200
+    occurrence: exactly_one
+  optimizer: adamw
+  learning_rate: 0.003
+  schedule:
+    name: constant
+    warmup_steps: 0
+    min_lr_ratio: 1.0
+  effective_batch_size: 128
+  micro_batch_size: 1
+  cross_entropy_backend: liger_fused
+  loss_normalization: token
+  batch_seed: 42
+  epochs: 2
+  weight_decay: 0.0
+  max_grad_norm: 10.0
+evaluation:
+  arms:
+    student:
+      generation:
+        temperature: 1.0
+        top_p: 1.0
+        max_new_tokens: 32000
+        samples_per_prompt: 32
+        provenance: Poro official AIME T=1.0; top_p=1.0 and max=32000 are local choices, with n reduced locally from avg@64 to avg@32
+    teacher:
+      generation:
+        temperature: 1.0
+        top_p: 1.0
+        max_new_tokens: 32000
+        samples_per_prompt: 32
+        provenance: Poro official AIME T=1.0; top_p=1.0 and max=32000 are local choices, with n reduced locally from avg@64 to avg@32
+    student_soft_prompt:
+      generation:
+        temperature: 1.0
+        top_p: 1.0
+        max_new_tokens: 32000
+        samples_per_prompt: 32
+        provenance: Poro official AIME T=1.0; top_p=1.0 and max=32000 are local choices, with n reduced locally from avg@64 to avg@32
+  benchmarks:
+    math_500:
+      generation:
+        temperature: 1.0
+        top_p: 1.0
+        max_new_tokens: 32000
+        samples_per_prompt: 4
+        provenance: local MATH-500 T=1.0/top_p=1.0/max=32000/avg@4 recipe; upstream reports the benchmark score but does not publish this exact generation contract

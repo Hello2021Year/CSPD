@@ -1,0 +1,65 @@
+# Runtime outputs and large experiment artifacts stay outside Git.  Their
+# durable paths and content hashes are recorded under experiments/.
+/artifacts/
+/.artifacts/
+/logs/
+
+# Python caches, test state, coverage, and build products.
+__pycache__/
+*.py[cod]
+*.pyo
+.pytest_cache/
+.coverage
+.coverage.*
+htmlcov/
+build/
+dist/
+*.egg-info/
+
+# Local environments and machine-specific configuration.
+.venv/
+venv/
+.env
+.env.*
+!.env.example
+.local/
+.cache/
+.cache_runtime/
+.idea/
+.vscode/
+.DS_Store
+
+# Editor and atomic-write leftovers.
+*.swp
+*.swo
+*~
+*.tmp
+
+# Downloaded datasets and generated experiment inputs stay out of Git. Their
+# immutable identities and hashes belong in task contracts and sidecar manifests.
+/data/external/
+/data/processed/
+/data/snapshots/
+/experiments/logs/
+/experiments/runs/
+/experiments/old_logs/
+/experiments/old_runs/
+/experiments/artifacts/
+
+# SGLang/CUDA crash dumps can be multi-gigabyte node-local diagnostics.
+/core.sglang::*
+
+/experiments/paper-figures/figures/
+/experiments/serving/engine/
+/experiments/serving/assets-*/
+/experiments/serving/data/longbench-v2/
+/experiments/serving/cache/
+/experiments/serving/results/
+/experiments/serving/model-path.txt
+/experiments/serving/model-provenance.json
+/experiments/serving/b200-*.pdf
+/experiments/serving/b200-*.png
+
+# GPQA prompts are rebuilt locally from the gated dataset (experiments/m2rl/eval/build_gpqa.py).
+/experiments/m2rl/eval/inputs/gpqa_diamond/questions.jsonl
+/experiments/m2rl/ood/inputs/

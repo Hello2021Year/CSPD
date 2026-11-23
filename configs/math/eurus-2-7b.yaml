@@ -1,0 +1,119 @@
+# Eurus-2-7B-SFT -> Eurus-2-7B-PRIME.
+schema_version: 1
+name: eurus-2-7b-sft-to-prime-sp256-q4-cap2-2ep
+task: eurus_math
+models:
+  student: PRIME-RL/Eurus-2-7B-SFT
+  teacher: PRIME-RL/Eurus-2-7B-PRIME
+  context_length:
+    student: 40960
+    teacher: 40960
+  config_overrides:
+    student:
+      max_position_embeddings: 40960
+    teacher:
+      max_position_embeddings: 40960
+template:
+  source: teacher
+  system:
+    mode: model_default
+  user:
+    field: problem
+    prefix: "<|soft_prompt|>"
+    suffix: "\n\nPresent the answer in LaTex format: \\boxed{Your answer}"
+  add_generation_prompt: true
+data:
+  sampling:
+    num_prompts: 8192
+  evaluation:
+    aime_2024:
+      num_prompts: all
+    math_500:
+      num_prompts: all
+    amc_2022_2023:
+      num_prompts: all
+    olympiad_bench:
+      num_prompts: all
+sampling:
+  trajectory_filter: correct_only
+  generation:
+    temperature: 1.0
+    top_p: 1.0
+    max_new_tokens: 32768
+    samples_per_prompt: 4
+    provenance: "default teacher sampling; 8192 math rows from the released Eurus-2 RL prompts x 4 requests"
+distillation:
+  objective: response_sft
+  attention_implementation: flash_attention_2
+  activation_checkpointing: true
+  checkpoint_every_updates: 20
+  prompt_length: 256
+  max_sequence_length: 40000
+  overlength_policy: filter
+  max_trajectories_per_question: 2
+  prompt_init:
+    method: sampled_vocabulary
+  insertion:
+    mode: placeholder
+    marker: "<|soft_prompt|>"
+    sentinel_id: -200
+    occurrence: exactly_one
+  optimizer: adamw
+  learning_rate: 0.003
+  schedule:
+    name: cosine
+    warmup_steps: 10
+    min_lr_ratio: 0.1
+  effective_batch_size: 128
+  micro_batch_size: 1
+  cross_entropy_backend: liger_fused
+  loss_normalization: sequence
+  batch_seed: 42
+  epochs: 2
+  weight_decay: 0.0
+  max_grad_norm: 10.0
+evaluation:
+  arms:
+    student:
+      generation:
+        temperature: 0.6
+        top_p: 0.95
+        max_new_tokens: 8192
+        samples_per_prompt: 32
+        provenance: user-requested T=0.6/top_p=0.95 with local size-tier policy; AIME has 30 questions so avg@32
+    teacher:
+      generation:
+        temperature: 0.6
+        top_p: 0.95
+        max_new_tokens: 8192
+        samples_per_prompt: 32
+        provenance: user-requested T=0.6/top_p=0.95 with local size-tier policy; AIME has 30 questions so avg@32
+    student_soft_prompt:
+      generation:
+        temperature: 0.6
+        top_p: 0.95
+        max_new_tokens: 8192
+        samples_per_prompt: 32
+        provenance: user-requested T=0.6/top_p=0.95 with local size-tier policy; AIME has 30 questions so avg@32
+  benchmarks:
+    math_500:
+      generation:
+        temperature: 0.6
+        top_p: 0.95
+        max_new_tokens: 8192
+        samples_per_prompt: 4
+        provenance: user-requested T=0.6/top_p=0.95 with local size-tier policy; MATH-500 has 500 questions so avg@4
+    amc_2022_2023:
+      generation:
+        temperature: 0.6
+        top_p: 0.95
+        max_new_tokens: 8192
+        samples_per_prompt: 8
+        provenance: user-requested T=0.6/top_p=0.95 with local size-tier policy; AMC23 has 83 questions so avg@8
+    olympiad_bench:
+      generation:
+        temperature: 0.6
+        top_p: 0.95
+        max_new_tokens: 8192
+        samples_per_prompt: 4
+        provenance: user-requested T=0.6/top_p=0.95 with local size-tier policy; OlympiadBench has 675 questions so avg@4

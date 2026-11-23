@@ -1,0 +1,6 @@
+{
+  "repo": "https://github.com/sgl-project/sglang.git",
+  "revision": "fd4b75c6960002d341cbb7bb127de7631770c87a",
+  "patch": "engine.patch",
+  "patch_contents": "multi-tenant soft prompts (input-only embedding pool, per-prompt prefix-cache ids, speculative decoding), interleaved MoE LoRA output, per-request adapter loading and request accounting used by the benchmark"
+}

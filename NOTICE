@@ -1,0 +1,31 @@
+The CSPD code is licensed under CC BY-NC 4.0 (see LICENSE). The files below
+are third-party code and keep their original licenses.
+
+Third-party code notices
+========================
+
+DeepScaleR math answer checker
+------------------------------
+
+`src/soft_prompt_distillation/tasks/math_grader.py` is vendored from:
+
+- Length-Value-Model/slime commit
+  `105eb2d28632097c7c3dff0ae4ccf554aa9e4666`, file
+  `slime/rollout/rm_hub/math_utils.py`, licensed under Apache License 2.0.
+- Its stated upstream source is agentica-project/deepscaler commit
+  `e6080ccd974eb64bd3430f0b36108244a6fee330`, file
+  `deepscaler/rewards/math_utils/utils.py`. DeepScaleR is released under the
+  MIT License, Copyright (c) 2025 Agentica.
+
+The vendored file includes Slime's restricted SymPy parser change. The small
+response-format wrapper in `tasks/deepscaler_math.py` is maintained locally.
+License texts are preserved in `licenses/Apache-2.0.txt` and
+`licenses/DeepScaleR-MIT.txt`.
+
+SGLang patch
+------------
+
+`experiments/serving/engine.patch` and `scripts/patch_sglang_runtime.py` modify
+SGLang (sgl-project/sglang), which is licensed under Apache License 2.0. The
+patch applies to SGLang and is distributed under that license
+(`licenses/Apache-2.0.txt`).

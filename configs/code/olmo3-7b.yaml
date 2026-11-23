@@ -1,0 +1,106 @@
+# allenai/Olmo-3-7B-Instruct-DPO -> final Instruct RLVR checkpoint.
+schema_version: 1
+name: olmo3-7b-code-lcb-v3-sp256-q4-cap2-2ep-lr0p01-constant
+task: olmo_code
+
+models:
+  student: allenai/Olmo-3-7B-Instruct-DPO
+  teacher: allenai/Olmo-3-7B-Instruct
+  revision:
+    student: b33130b7de49f0c2553b5c2b3bc8409ff3e627d1
+    teacher: 6e5971d9eba42665f5bd5a0fcf047f299ce1dccc
+  context_length:
+    student: 65536
+    teacher: 65536
+
+template:
+  source: teacher
+  system:
+    # Dolci-Instruct-RL stores input_ids_prompt rendered with the tokenizer's
+    # default function-calling system. Sampling validates every rendered row
+    # against those source token IDs before generation.
+    mode: model_default
+  user:
+    field: problem
+    prefix: "<|soft_prompt|>"
+    suffix: ""
+  add_generation_prompt: true
+
+data:
+  sampling:
+    num_prompts: 8192
+  evaluation:
+    livecodebench_v3:
+      num_prompts: all
+
+sampling:
+  trajectory_filter: correct_only
+  generation:
+    temperature: 1.0
+    top_p: 1.0
+    max_new_tokens: 32768
+    samples_per_prompt: 4
+    stop_token_ids:
+      - 100265
+      - 100257
+    provenance: 8192 deterministic-reservoir code prompts from pinned Dolci-Instruct-RL x4; tokenizer-default prompt is checked against each row's official input_ids_prompt; generated response IDs are preserved while special-token-clean text is passed to exact Open Instruct last-python-fence/full-output extraction and its per-assertion 1s/0.99 verifier contract
+
+distillation:
+  objective: response_sft
+  attention_implementation: flash_attention_2
+  activation_checkpointing: true
+  checkpoint_every_updates: 20
+  prompt_length: 256
+  max_sequence_length: 40000
+  overlength_policy: filter
+  max_trajectories_per_question: 2
+  prompt_init:
+    method: sampled_vocabulary
+  insertion:
+    mode: placeholder
+    marker: "<|soft_prompt|>"
+    sentinel_id: -200
+    occurrence: exactly_one
+  optimizer: adamw
+  learning_rate: 0.01
+  schedule:
+    name: constant
+    warmup_steps: 0
+    min_lr_ratio: 1.0
+  effective_batch_size: 128
+  micro_batch_size: 1
+  cross_entropy_backend: liger_fused
+  loss_normalization: sequence
+  batch_seed: 42
+  epochs: 2
+  weight_decay: 0.0
+  max_grad_norm: 10.0
+
+evaluation:
+  # OLMES olmo3:adapt evaluates LiveCodeBench with a code-specific system,
+  # which intentionally differs from the released RL rollout prompt above.
+  template:
+    source: teacher
+    system:
+      mode: text
+      text: You are an expert Python programmer. You will be given a question (problem specification) and will generate a correct Python program that matches the specification and passes all tests.
+    user:
+      field: problem
+      prefix: "<|soft_prompt|>"
+      suffix: ""
+    add_generation_prompt: true
+  arms:
+    student:
+      generation: &olmo_code_eval
+        temperature: 0.6
+        top_p: 0.95
+        max_new_tokens: 32768
+        samples_per_prompt: 10
+        stop_token_ids:
+          - 100265
+          - 100257
+        provenance: Olmo 3 paper Table 16 and OLMES@7bebf0e instruct suite task livecodebench_codegeneration::olmo3:adapt exact LiveCodeBench v3 prompt/T=0.6/top_p=0.95/max=32768/avg@10 recipe, no task stop strings, and pinned generation_config stop IDs
+    teacher:
+      generation: *olmo_code_eval
+    student_soft_prompt:
+      generation: *olmo_code_eval

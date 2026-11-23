@@ -1,0 +1,1 @@
+{"schema":"soft-prompt-code-verifier-request-v1","request_id":0,"protocol":"livecodebench","code":"x = bytearray(40 * 1024 * 1024 * 1024)\nprint(len(x))","payload":{"input_output":{"inputs":["\n"],"outputs":["42949672960\n"],"fn_name":null}},"grader_requested":"livecodebench@28fef95ea8c9f7a547c8329f2cd3d32b92c1fa24:code_generation"}

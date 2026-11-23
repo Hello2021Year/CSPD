@@ -1,0 +1,99 @@
+# MiMo code checkpoints on an explicitly labeled AReaL proxy.
+schema_version: 1
+name: mimo-7b-areal-proxy-code-lcb-sp256-q4-cap2-2ep-lr0p003-constant
+task: mimo_areal_proxy_code
+
+models:
+  student: XiaomiMiMo/MiMo-7B-SFT
+  teacher: XiaomiMiMo/MiMo-7B-RL
+  revision:
+    student: 2c8c99d54d85f77dd003a1a473ceff1a101d30ec
+    teacher: 6299b5a2c45daf0c429285c92b8e61a5bd011c0d
+  trust_remote_code:
+    student: true
+    teacher: true
+  context_length:
+    student: 32768
+    teacher: 32768
+
+template:
+  source: teacher
+  system:
+    mode: empty
+  user:
+    field: problem
+    prefix: "<|soft_prompt|>"
+    suffix: ""
+  add_generation_prompt: true
+
+data:
+  sampling:
+    num_prompts: 7500
+  evaluation:
+    livecodebench_v5:
+      num_prompts: all
+    livecodebench_v6:
+      num_prompts: all
+
+sampling:
+  trajectory_filter: correct_only
+  generation:
+    temperature: 1.0
+    top_p: 1.0
+    max_new_tokens: 32768
+    samples_per_prompt: 4
+    stop_token_ids:
+      - 151645
+    provenance: >-
+      AReaL 8B training-question transfer: inclusionAI/AReaL-boba-2-RL-Code
+      train/train.jsonl revision 1abdc2c4884eb6c4411c0d5c5e42da5e2be817de,
+      deterministic reservoir seed 42, 7500 prompts x4. Fresh MiMo RL
+      rollouts, not AReaL-generated answers. Original Klear used 8192 prompts;
+      this comparison also changes prompt count to the donor's 7500.
+
+distillation:
+  objective: response_sft
+  attention_implementation: flash_attention_2
+  activation_checkpointing: true
+  checkpoint_every_updates: 20
+  prompt_length: 256
+  max_sequence_length: 32768
+  overlength_policy: filter
+  max_trajectories_per_question: 2
+  prompt_init:
+    method: sampled_vocabulary
+  insertion:
+    mode: placeholder
+    marker: "<|soft_prompt|>"
+    sentinel_id: -200
+    occurrence: exactly_one
+  optimizer: adamw
+  learning_rate: 0.003
+  schedule:
+    name: constant
+    warmup_steps: 0
+    min_lr_ratio: 1.0
+  effective_batch_size: 128
+  micro_batch_size: 1
+  cross_entropy_backend: liger_fused
+  loss_normalization: sequence
+  batch_seed: 42
+  epochs: 2
+  weight_decay: 0.0
+  max_grad_norm: 10.0
+
+evaluation:
+  arms:
+    student:
+      generation: &mimo_code_eval
+        temperature: 0.6
+        top_p: 1.0
+        max_new_tokens: 32768
+        samples_per_prompt: 8
+        stop_token_ids:
+          - 151645
+        provenance: MiMo official T=0.6 and LiveCodeBench avg@8 recipe
+    teacher:
+      generation: *mimo_code_eval
+    student_soft_prompt:
+      generation: *mimo_code_eval

@@ -1,0 +1,99 @@
+# Klear-Reasoner-8B-SFT -> Klear-Reasoner-8B (GPPO).
+schema_version: 1
+name: klear-reasoner-8b-sft-to-gppo-sp256-q4-cap2-2ep-lr0p01-constant
+task: klear_math
+
+models:
+  student: Kwai-Klear/Klear-Reasoner-8B-SFT
+  teacher: Kwai-Klear/Klear-Reasoner-8B
+
+template:
+  source: teacher
+  system:
+    mode: model_default
+  user:
+    field: problem
+    prefix: "<|soft_prompt|>"
+    suffix: ""
+  add_generation_prompt: true
+
+data:
+  sampling:
+    num_prompts: 8192
+  evaluation:
+    aime_2024:
+      num_prompts: all
+    aime_2025:
+      num_prompts: all
+    hmmt_feb_2025:
+      num_prompts: all
+
+sampling:
+  trajectory_filter: correct_only
+  generation:
+    temperature: 1.0
+    top_p: 1.0
+    max_new_tokens: 32768
+    samples_per_prompt: 4
+    provenance: default teacher sampling; 8192 MathSub-30K prompts x 4 requests
+
+distillation:
+  objective: response_sft
+  attention_implementation: flash_attention_2
+  activation_checkpointing: true
+  checkpoint_every_updates: 20
+  prompt_length: 256
+  max_sequence_length: 40000
+  overlength_policy: filter
+  max_trajectories_per_question: 2
+  prompt_init:
+    method: sampled_vocabulary
+  insertion:
+    mode: placeholder
+    marker: "<|soft_prompt|>"
+    sentinel_id: -200
+    occurrence: exactly_one
+  optimizer: adamw
+  learning_rate: 0.01
+  schedule:
+    name: constant
+    warmup_steps: 0
+    min_lr_ratio: 1.0
+  effective_batch_size: 128
+  micro_batch_size: 1
+  cross_entropy_backend: liger_fused
+  loss_normalization: sequence
+  batch_seed: 42
+  epochs: 2
+  weight_decay: 0.0
+  max_grad_norm: 10.0
+
+evaluation:
+  arms:
+    student:
+      generation:
+        temperature: 0.6
+        top_p: 0.95
+        top_k: 20
+        repetition_penalty: 1.05
+        max_new_tokens: 32768
+        samples_per_prompt: 16
+        provenance: local avg@16 Klear evaluation with official top_k=20 and repetition_penalty=1.05; official model card reports avg@64
+    teacher:
+      generation:
+        temperature: 0.6
+        top_p: 0.95
+        top_k: 20
+        repetition_penalty: 1.05
+        max_new_tokens: 32768
+        samples_per_prompt: 16
+        provenance: local avg@16 Klear evaluation with official top_k=20 and repetition_penalty=1.05; official model card reports avg@64
+    student_soft_prompt:
+      generation:
+        temperature: 0.6
+        top_p: 0.95
+        top_k: 20
+        repetition_penalty: 1.05
+        max_new_tokens: 32768
+        samples_per_prompt: 16
+        provenance: local avg@16 Klear evaluation with official top_k=20 and repetition_penalty=1.05; official model card reports avg@64

@@ -1,0 +1,116 @@
+# Prompt-length ablation arm: 128 tokens. All other fields match the validated 256-token sink-safe run.
+# GPT-OSS-Swallow 20B corrected sink-attention run. This preserves the
+# historical system-front insertion recipe while aligning the optimizer and
+# token-normalized objective with the successful Swallow runs.
+schema_version: 1
+name: gpt-oss-swallow-20b-system-front-lr0p01-token-flex-sp128-2ep
+task: gpt_oss_swallow_math
+
+models:
+  student: tokyotech-llm/GPT-OSS-Swallow-20B-SFT-v0.1
+  teacher: tokyotech-llm/GPT-OSS-Swallow-20B-RL-v0.1
+
+template:
+  source: teacher
+  system:
+    mode: model_default
+  user:
+    field: problem
+    prefix: ""
+    suffix: ""
+  add_generation_prompt: true
+  chat_template_kwargs:
+    reasoning_effort: medium
+  chat_template_replacements:
+    'strftime_now("%Y-%m-%d")': '"2026-08-21"'
+    '{{- model_identity + "\n" }}': '{{- "<|soft_prompt|>" + model_identity + "\n" }}'
+
+data:
+  sampling:
+    num_prompts: 8192
+  evaluation:
+    aime_2024:
+      num_prompts: all
+    aime_2025:
+      num_prompts: all
+    math_500:
+      num_prompts: all
+
+sampling:
+  trajectory_filter: correct_only
+  generation:
+    temperature: 1.0
+    top_p: 1.0
+    max_new_tokens: 32768
+    samples_per_prompt: 4
+    provenance: reused GPT-OSS-Swallow teacher sampling; 8192 Dolci-Think-RL-7B math prompts x 4 requests
+
+distillation:
+  objective: response_sft
+  # Transformers' GPT-OSS FlexAttention integration retains its learned
+  # per-head sinks and sliding/full layer masks. Generic FA2 drops the sinks.
+  attention_implementation: flex_attention
+  activation_checkpointing: true
+  checkpoint_every_updates: 20
+  prompt_length: 128
+  max_sequence_length: 40000
+  overlength_policy: filter
+  max_trajectories_per_question: 2
+  prompt_init:
+    method: sampled_vocabulary
+    seed: 42
+  insertion:
+    mode: placeholder
+    marker: "<|soft_prompt|>"
+    sentinel_id: -200
+    occurrence: exactly_one
+  optimizer: adamw
+  learning_rate: 0.01
+  schedule:
+    name: constant
+    warmup_steps: 0
+    min_lr_ratio: 1.0
+  effective_batch_size: 128
+  micro_batch_size: 1
+  cross_entropy_backend: liger_fused
+  loss_normalization: token
+  batch_seed: 42
+  epochs: 2
+  weight_decay: 0.0
+  max_grad_norm: 10.0
+
+evaluation:
+  arms:
+    student:
+      generation:
+        temperature: 0.6
+        top_p: 0.95
+        top_k: 20
+        max_new_tokens: 32768
+        samples_per_prompt: 32
+        provenance: GPT-OSS-Swallow recommended T=0.6/top_p=0.95/top_k=20 and AIME avg@32
+    teacher:
+      generation:
+        temperature: 0.6
+        top_p: 0.95
+        top_k: 20
+        max_new_tokens: 32768
+        samples_per_prompt: 32
+        provenance: reused GPT-OSS-Swallow baseline; recommended T=0.6/top_p=0.95/top_k=20 and AIME avg@32
+    student_soft_prompt:
+      generation:
+        temperature: 0.6
+        top_p: 0.95
+        top_k: 20
+        max_new_tokens: 32768
+        samples_per_prompt: 32
+        provenance: GPT-OSS-Swallow recommended T=0.6/top_p=0.95/top_k=20 and AIME avg@32
+  benchmarks:
+    math_500:
+      generation:
+        temperature: 0.6
+        top_p: 0.95
+        top_k: 20
+        max_new_tokens: 32768
+        samples_per_prompt: 4
+        provenance: GPT-OSS-Swallow recommended decoding with MATH-500 avg@4

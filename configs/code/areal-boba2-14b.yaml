@@ -1,0 +1,110 @@
+# Qwen3 14B -> AReaL boba2 14B Open code RL.
+schema_version: 1
+name: areal-boba2-14b-open-code-lcb-sp256-q4-cap2-2ep-lr0p01-constant
+task: areal_code
+
+models:
+  student: Qwen/Qwen3-14B
+  teacher: inclusionAI/AReaL-boba-2-14B-Open
+  revision:
+    student: 40c069824f4251a91eefaf281ebe4c544efd3e18
+    teacher: e9a5e3785c29014dda82bbb65d271c0f260e9ea9
+  context_length:
+    student: 40960
+    teacher: 40960
+
+template:
+  source: teacher
+  system:
+    mode: model_default
+  user:
+    field: problem
+    prefix: "<|soft_prompt|>"
+    suffix: "\n/think"
+  add_generation_prompt: true
+  chat_template_kwargs:
+    enable_thinking: true
+  assistant_prefix: "<think>"
+
+data:
+  sampling:
+    num_prompts: 7500
+  evaluation:
+    livecodebench_v5_2410_2502:
+      num_prompts: all
+
+sampling:
+  trajectory_filter: correct_only
+  generation:
+    temperature: 1.0
+    top_p: 1.0
+    top_k: -1
+    max_new_tokens: 27648
+    samples_per_prompt: 4
+    stop_token_ids:
+      - 151645
+      - 151643
+    stop_strings:
+      - "</s>"
+      - "<|im_end|>"
+      - "<|endoftext|>"
+    provenance: >-
+      AReaL v0.3 Qwen3 code rollout uses temperature 1.0, top_p 1.0,
+      effectively unbounded top_k, and max_new_tokens 27648; campaign keeps
+      the common four-rollout recipe
+
+distillation:
+  objective: response_sft
+  attention_implementation: flash_attention_2
+  activation_checkpointing: true
+  checkpoint_every_updates: 20
+  prompt_length: 256
+  max_sequence_length: 40000
+  overlength_policy: filter
+  max_trajectories_per_question: 2
+  prompt_init:
+    method: sampled_vocabulary
+  insertion:
+    mode: placeholder
+    marker: "<|soft_prompt|>"
+    sentinel_id: -200
+    occurrence: exactly_one
+  optimizer: adamw
+  learning_rate: 0.01
+  schedule:
+    name: constant
+    warmup_steps: 0
+    min_lr_ratio: 1.0
+  effective_batch_size: 128
+  micro_batch_size: 1
+  cross_entropy_backend: liger_fused
+  loss_normalization: sequence
+  batch_seed: 42
+  epochs: 2
+  weight_decay: 0.0
+  max_grad_norm: 10.0
+
+evaluation:
+  arms:
+    student:
+      generation: &areal_eval
+        temperature: 1.0
+        top_p: 0.95
+        top_k: -1
+        max_new_tokens: 32768
+        samples_per_prompt: 8
+        stop_token_ids:
+          - 151645
+          - 151643
+        stop_strings:
+          - "</s>"
+          - "<|im_end|>"
+          - "<|endoftext|>"
+        provenance: >-
+          AReaL boba2 model card and v0.3 evaluation guide exact code recipe:
+          qwen3-think-pure, average eight samples, temperature 1.0, top_p 0.95,
+          top_k -1, max 32768
+    teacher:
+      generation: *areal_eval
+    student_soft_prompt:
+      generation: *areal_eval

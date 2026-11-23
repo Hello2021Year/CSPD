@@ -1,0 +1,128 @@
+# The full evaluation contract over the correct_only retrain: aime_2024,
+# aime_2025 and math_500 at the same avg@32 the original olmo3 run used, so these
+# numbers ARE comparable to its 18.8%.
+#
+# Shares the fast run's snapshot and its trained prompt, so it re-evaluates rather
+# than retraining. Hold this until the fast aime_2024 read says the retrain is
+# worth the GPU hours; 3,920 generations per checkpoint against 240 is not worth
+# spending on a null result.
+# olmo3-7b.yaml with the two fields that make it unlike every other pair in
+# configs/ brought into line: correct_only instead of all, and sequence instead
+# of token loss normalisation.
+#
+# trajectory_filter is the substantive one. Grading only runs when the filter is
+# correct_only, so olmo3's snapshot stored correct=None for all 32,400 rows and
+# nothing was ever checked. Grading them after the fact puts 32.8% of that
+# snapshot -- 10,622 trajectories -- at the wrong answer. Every other pair trains
+# on verified-correct teacher behaviour only; olmo3 spent a third of its budget
+# learning the teacher's mistakes.
+#
+# The snapshot here is that same sampling run with the failures removed: 21,778
+# trajectories over 6,405 questions, no regeneration.
+#
+# Left alone deliberately: prompt_length 128 and the 1e-2 constant schedule. They
+# differ from the other pairs but they are exactly what the earlier run used when
+# it reached +100.0 on this pair, so moving them would walk away from the only
+# known-good setting.
+# OLMo-3 7B Instruct DPO -> final RLVR soft-prompt distillation.
+schema_version: 1
+name: olmo3-7b-correctonly-fulleval
+task: olmo_math
+
+models:
+  student: allenai/Olmo-3-7B-Instruct-DPO
+  teacher: allenai/Olmo-3-7B-Instruct
+
+template:
+  source: teacher
+  system:
+    mode: text
+    text: "You are a helpful function-calling AI assistant. You do not currently have access to any functions. <functions></functions>"
+  user:
+    field: problem
+    prefix: "<|soft_prompt|>"
+    suffix: "\n\nPlease reason step by step, and put your final answer within \\boxed{}."
+  add_generation_prompt: true
+
+data:
+  sampling:
+    num_prompts: 8192
+  evaluation:
+    math_500:
+      num_prompts: all
+    aime_2024:
+      num_prompts: all
+    aime_2025:
+      num_prompts: all
+
+sampling:
+  trajectory_filter: correct_only
+  generation:
+    temperature: 1.0
+    top_p: 1.0
+    max_new_tokens: 32768
+    samples_per_prompt: 4
+    provenance: default teacher sampling; 8192 OLMo RLVR prompts x 4 requests
+
+distillation:
+  objective: response_sft
+  attention_implementation: flash_attention_2
+  activation_checkpointing: true
+  checkpoint_every_updates: 20
+  prompt_length: 128
+  max_sequence_length: 40000
+  overlength_policy: filter
+  max_trajectories_per_question: 2
+  prompt_init:
+    method: sampled_vocabulary
+  insertion:
+    mode: placeholder
+    marker: "<|soft_prompt|>"
+    sentinel_id: -200
+    occurrence: exactly_one
+  optimizer: adamw
+  learning_rate: 0.01
+  schedule:
+    name: constant
+    warmup_steps: 10
+    min_lr_ratio: 1.0
+  effective_batch_size: 128
+  micro_batch_size: 8
+  cross_entropy_backend: liger_fused
+  loss_normalization: sequence
+  batch_seed: 42
+  epochs: 2
+  weight_decay: 0.0
+  max_grad_norm: 1.0
+
+evaluation:
+  benchmarks:
+    math_500:
+      generation:
+        temperature: 0.6
+        top_p: 0.95
+        max_new_tokens: 32768
+        samples_per_prompt: 4
+        provenance: official OLMo-3 recommended and evaluated decoding with local size-tier avg@4 for 500-question MATH-500
+  arms:
+    student:
+      generation:
+        temperature: 0.6
+        top_p: 0.95
+        max_new_tokens: 32768
+        samples_per_prompt: 32
+        provenance: official OLMo-3 recommended and evaluated decoding with local size-tier avg@32 for AIME
+    teacher:
+      generation:
+        temperature: 0.6
+        top_p: 0.95
+        max_new_tokens: 32768
+        samples_per_prompt: 32
+        provenance: official OLMo-3 recommended and evaluated decoding with local size-tier avg@32 for AIME
+    student_soft_prompt:
+      generation:
+        temperature: 0.6
+        top_p: 0.95
+        max_new_tokens: 32768
+        samples_per_prompt: 32
+        provenance: official OLMo-3 recommended and evaluated decoding with local size-tier avg@32 for AIME

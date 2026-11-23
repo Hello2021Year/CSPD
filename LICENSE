@@ -1,0 +1,42 @@
+CSPD: Composable Soft-Prompt Distillation of RL Experts
+
+Copyright (c) 2026 The CSPD Authors
+
+The code in this repository is licensed under the Creative Commons
+Attribution-NonCommercial 4.0 International License (CC BY-NC 4.0).
+
+You are free to:
+  - Share — copy and redistribute the material in any medium or format.
+  - Adapt — remix, transform, and build upon the material.
+
+Under the following terms:
+  - Attribution — You must give appropriate credit (cite the paper below),
+    provide a link to the license, and indicate if changes were made.
+  - NonCommercial — You may not use the material for commercial purposes.
+
+No additional restrictions — You may not apply legal terms or technological
+measures that legally restrict others from doing anything the license permits.
+
+Full legal text: https://creativecommons.org/licenses/by-nc/4.0/legalcode
+Human-readable summary: https://creativecommons.org/licenses/by-nc/4.0/
+
+THIRD-PARTY COMPONENTS
+Files vendored or adapted from other projects keep their original licenses;
+see NOTICE and licenses/. Models, datasets and benchmarks used by the scripts
+are governed by their own licenses.
+
+Please cite:
+
+  @article{zhang2026cspd,
+    title   = {Composable Soft-Prompt Distillation of {RL} Experts: Toward
+               Continual Post-Training},
+    author  = {Zhang, Zhen and Yang, Changyi and He, Xuehai and Liu, Chengzhi and
+               Yin, Yutong and Liu, Ziyue and Yin, Zhuoran and Li, Yangmin and
+               Liu, Zhihan and Li, Jisen and Jin, Mingyu and Li, Chuhan and
+               Weng, Zhaotian and He, Ruoyu and Gao, Wenyao and Deng, Jiaxin and
+               Wu, Chenwei and Shen, Hui and Chai, Wenhao and Zhao, Chenyang and
+               Ying, Zhuofan and Liu, Kieran and Chen, Andrew and Ma, Pony and
+               Wang, Zhaoran and Patel, Alkesh and Gan, Zhe and Wang, Xin Eric},
+    journal = {arXiv preprint arXiv:2611.27376},
+    year    = {2026}
+  }

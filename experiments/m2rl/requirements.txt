@@ -1,0 +1,18 @@
+# Runtime for M2RL training (train_sp.py, baselines/) and evaluation (eval/), tested on B200 with CUDA 12.8.
+# Install the repository package as well: pip install -e '.[data]'
+vllm==0.11.0
+torch==2.8.0
+transformers==4.57.1
+liger-kernel==0.6.2
+peft>=0.13
+safetensors
+huggingface_hub>=0.34,<1.0
+# graders: IFBench (allenai/IFBench) and LiveCodeBench (lcb_runner)
+langdetect
+nltk
+absl-py
+immutabledict
+emoji
+syllapy>=0.8.0
+pebble>=5.1.0
+datasets>=3.6,<4.1
