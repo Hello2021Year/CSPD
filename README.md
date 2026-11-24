@@ -153,6 +153,8 @@ pytest                                  # CPU tests
 
 The single-expert pipeline generates with SGLang (`pip install -e '.[sglang]'`, see `scripts/setup_runtime.sh`). For the multi-expert experiments, generation (`teacher/sample_teacher.py`, `eval/generate.py`, `ood/bfcl/run.py`) runs in the SGLang 0.5.18 environment from `scripts/setup_blackwell_runtime.sh`. Training, baselines and scoring run in the environment pinned in [`experiments/m2rl/requirements.txt`](experiments/m2rl/requirements.txt), which also provides vLLM 0.11 for `--engine vllm` and the XSTest judge.
 
+See [environment/](environment/README.md) for setup commands and a Table 2 reproduction guide.
+
 ## Reproducing the experiments
 
 ### Multi-expert composition (Table 2, Figure 3)
