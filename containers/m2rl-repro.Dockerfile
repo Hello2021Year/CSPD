@@ -1,6 +1,7 @@
 ARG CSPD_BASE=lmsysorg/sglang:latest
 FROM ${CSPD_BASE}
 
+ARG CSPD_GEN_RUNTIME=blackwell
 USER root
 WORKDIR /opt/CSPD
 ENV PATH="/opt/bootstrap/bin:${PATH}"
@@ -12,8 +13,13 @@ RUN command -v uv >/dev/null || \
     (python3 -m venv /opt/bootstrap && /opt/bootstrap/bin/python -m pip install uv)
 
 COPY . .
-RUN bash scripts/setup_blackwell_runtime.sh /opt/gen && \
-    uv venv --python 3.11 /opt/score && \
+RUN if [ "$CSPD_GEN_RUNTIME" = base ]; then \
+      python3 -m venv --system-site-packages --without-pip /opt/gen && \
+      UV_MANAGED_PYTHON=0 uv pip install --python /opt/gen/bin/python .; \
+    else \
+      bash scripts/setup_blackwell_runtime.sh /opt/gen; \
+    fi
+RUN uv venv --python 3.11 /opt/score && \
     uv pip install --python /opt/score/bin/python -r experiments/m2rl/requirements.txt '.[data,test]'
 
 RUN git init -q /opt/gorilla && \
@@ -24,5 +30,7 @@ RUN git init -q /opt/gorilla && \
       -e /opt/gorilla/berkeley-function-call-leaderboard soundfile 'transformers==4.57.1'
 
 # Prefetch only the public LiveCodeBench data used by the offline grader.
-RUN HOME=/opt/lcb-cache HF_HOME=/opt/lcb-cache/hf /opt/score/bin/python -c \
-    'import json, sys; sys.path.insert(0, "experiments/m2rl/eval"); import score as s; s.git_checkout(s.LCB_REPO, s.LCB_COMMIT); refs = [json.loads(line) for line in open("experiments/m2rl/eval/inputs/lcb_v5/references.jsonl")]; [s._lcb_row(ref) for ref in refs]'
+RUN HOME=/opt/lcb-cache HF_HOME=/opt/lcb-cache/hf HF_HUB_CACHE=/opt/lcb-cache/hf/hub \
+    HF_HUB_OFFLINE=0 TRANSFORMERS_OFFLINE=0 /opt/score/bin/python -c \
+    'import json, sys; sys.path.insert(0, "experiments/m2rl/eval"); import score as s; s.git_checkout(s.LCB_REPO, s.LCB_COMMIT); refs = [json.loads(line) for line in open("experiments/m2rl/eval/inputs/lcb_v5/references.jsonl")]; [s._lcb_row(ref) for ref in refs]' && \
+    chmod -R a+rX /opt/lcb-cache

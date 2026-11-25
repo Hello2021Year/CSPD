@@ -1,5 +1,29 @@
 # M2RL Docker 批量评测
 
+## 单机八卡（`qwen-jev:x2-3-jev`）
+
+在装有该镜像的八卡服务器上，从 CSPD 仓库根目录执行。启动器要求八张卡各有至少 95% 空闲显存；每张卡独立处理一项评测，不使用八卡张量并行。
+
+```bash
+nvidia-smi
+bash environment/run_m2rl_docker.sh --plan all
+
+export CSPD_BASE=qwen-jev:x2-3-jev
+export CSPD_GEN_RUNTIME=base
+export CSPD_OUT="$PWD/artifacts/x2-3-full"
+export CSPD_HF_CACHE="$CSPD_OUT/hf"  # 有现成缓存时，改成包含 hub/ 的 HF_HOME
+export CSPD_HF_OFFLINE=1
+mkdir -p "$CSPD_OUT"
+nohup bash environment/run_m2rl_docker.sh all > "$CSPD_OUT/launcher.log" 2>&1 < /dev/null &
+echo "PID=$!"
+```
+
+镜像里的 CUDA、Torch 和 SGLang 用于生成，评分和 BFCL 则在独立环境运行。首次构建镜像仍需能访问依赖和公共 LCB 数据；`CSPD_HF_OFFLINE` 只控制运行时 Hugging Face 客户端。启动器会先跑测试并检查固定版本的 M2RL-SFT 可用性。`CSPD_HF_CACHE` 指向的是包含 `hub/models--Jackwang111--M2RL-SFT/` 的上一级 HF_HOME（保留完整的 Hub 缓存结构，包括 `blobs` 和 `snapshots`），不是模型目录。如果已有的只是空缓存，或者固定版本未缓存，默认不会下载模型。
+
+如果确认机器可访问 Hugging Face、磁盘容量足够，且允许多模型下载，再设 `export CSPD_HF_OFFLINE=0` 后启动。启动器显式覆盖基础镜像的 `HF_HUB_OFFLINE` 等变量。GPQA 需要数据集授权：联网运行时在启动前交互式设置 `HF_TOKEN`（见下文），或复用已授权下载并按固定版本缓存的数据。缺失的 GPQA 或域外输入会使对应任务失败，其他任务继续。监控用 `tail -f "$CSPD_OUT/launcher.log"`，汇总位于 `$CSPD_OUT/<commit>/node-all/scores.tsv`。不要同时启动两个写入同一输出目录的实例；若换镜像或评测环境，使用新的输出目录。
+
+## 双机分工
+
 在两台 Linux GPU 主机上用同一个 Git 提交作为评测源码。默认 Docker 基础镜像是本机已有的 `lmsysorg/sglang:latest`。脚本在基础镜像上构建仓库指定的 SGLang 0.5.18、评分环境和 BFCL 环境。Docker 必须能访问 GPU。首次构建和运行需要能访问 PyPI、GitHub 和 Hugging Face，并预留模型与 Docker 镜像所需的磁盘空间。
 
 ```bash
