@@ -29,14 +29,18 @@ case "${1:-}" in
             exit 2
         fi
         exit 0 ;;
-    0|1) node=$1; nodes=2; offline_default=0 ;;
-    all) node=0; nodes=1; offline_default=1 ;;
+    0|1)
+        node=$1; nodes=2; offline_default=0
+        base_default=lmsysorg/sglang:latest; runtime_default=blackwell ;;
+    all)
+        node=0; nodes=1; offline_default=1
+        base_default=docker.m.daocloud.io/lmsysorg/sglang:qwen38-27b-cu129; runtime_default=base ;;
     *) printf 'Usage: bash environment/run_m2rl_docker.sh {0|1|all|--plan [all]}\n' >&2; exit 2 ;;
 esac
 if (( $# != 1 )); then exit 2; fi
 
-base=${CSPD_BASE:-lmsysorg/sglang:latest}
-runtime=${CSPD_GEN_RUNTIME:-blackwell}
+base=${CSPD_BASE:-$base_default}
+runtime=${CSPD_GEN_RUNTIME:-$runtime_default}
 case "$runtime" in
     blackwell|base) ;;
     *) echo 'CSPD_GEN_RUNTIME must be blackwell or base.' >&2; exit 2 ;;
@@ -46,7 +50,8 @@ case "$offline" in
     0|1) ;;
     *) echo 'CSPD_HF_OFFLINE must be 0 or 1.' >&2; exit 2 ;;
 esac
-commit=$(git rev-parse --short=12 HEAD)
+revision=$(git rev-parse HEAD)
+commit=$(git rev-parse --short=12 "$revision")
 image="cspd-m2rl-repro:$commit-$runtime"
 root=${CSPD_OUT:-$PWD/artifacts/docker-repro}
 mkdir -p "$root"
@@ -76,9 +81,11 @@ fi
 nvidia-smi -L
 docker image inspect "$base" >/dev/null
 
-context=$(mktemp -d)
+context=$(mktemp -d "$root/.docker-context.XXXXXX")
 trap 'rm -rf "$context"' EXIT
-git archive HEAD | tar -xf - -C "$context"
+git init --quiet --template= "$context"
+git -C "$context" -c protocol.file.allow=always fetch --quiet --depth=1 --no-tags --no-write-fetch-head "$repo" "$revision"
+git -C "$context" -c core.logAllRefUpdates=false checkout --quiet --detach "$revision"
 cp containers/m2rl-repro.Dockerfile "$context/Dockerfile"
 docker build --build-arg "CSPD_BASE=$base" --build-arg "CSPD_GEN_RUNTIME=$runtime" --tag "$image" "$context"
 
@@ -102,7 +109,7 @@ dock() {
 dock "${gpus[0]}" "$gen" -c \
     'import torch, sglang, transformers; assert torch.cuda.device_count() == 1; print(torch.cuda.get_device_name(0), "CUDA", torch.version.cuda, "SGLang", sglang.__version__, "Transformers", transformers.__version__)'
 if (( nodes == 1 )); then
-    dock cpu "$score" -m pytest
+    dock cpu "$score" -m pytest -p no:cacheprovider
     if ! dock cpu "$gen" -c '
 import json
 from pathlib import Path

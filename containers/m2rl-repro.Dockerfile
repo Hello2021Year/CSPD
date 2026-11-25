@@ -9,6 +9,7 @@ ENV UV_PYTHON_INSTALL_DIR=/opt/uv-python UV_MANAGED_PYTHON=1
 
 RUN command -v git >/dev/null || \
     (apt-get update && apt-get install -y --no-install-recommends git && rm -rf /var/lib/apt/lists/*)
+RUN git config --system --add safe.directory /opt/CSPD
 RUN command -v uv >/dev/null || \
     (python3 -m venv /opt/bootstrap && /opt/bootstrap/bin/python -m pip install uv)
 
