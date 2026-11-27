@@ -29,7 +29,7 @@ environment/.venv/cpu/bin/python experiments/m2rl/compose.py \
 
 ## 用发布 prompt 复现 Table 2
 
-两台 GPU 机器都有 SGLang Docker 镜像时，可以用 [M2RL Docker 批量评测](M2RL_DOCKER.md) 分工运行 Table 2 和 Table 3 的已发布模型与软提示。每项任务都会保存自己的运行日志和评分。
+已有 GPU Docker 环境时，可以用 [M2RL Docker 批量评测](M2RL_DOCKER.md) 做单卡链路试跑，或复现 Table 2 和 Table 3 的已发布模型与软提示。每项任务保存日志和评分，校验脚本将结果与论文对照。
 
 完成 GPU 环境安装后，先验证 AIME24 的生成链路。以下试跑设为每题 1 次。
 

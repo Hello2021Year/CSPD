@@ -10,15 +10,41 @@ score=/opt/score/bin/python
 in_benches=(aime24 lcb_v5 gpqa_diamond ifbench)
 ood_benches=(triviaqa truthfulqa xstest bbeh finqa bfcl)
 in_methods=(MCSI student ISCM single_sp oracle mopd I SI CSI MSI MCI MCS)
+prompt_orders=(MCSI ISCM I SI CSI MSI MCI MCS M C S)
+suite=${CSPD_SUITE:-full}
+run_in_domain=1
+run_ood=1
+case "$suite" in
+    full) ;;
+    table2)
+        in_methods=(MCSI student ISCM single_sp oracle mopd)
+        run_ood=0
+        prompt_orders=(MCSI ISCM M C S I) ;;
+    table3)
+        in_methods=(MCSI student mopd)
+        run_in_domain=0
+        prompt_orders=(MCSI) ;;
+    mcsi|smoke)
+        in_methods=(MCSI)
+        run_ood=0
+        prompt_orders=(MCSI)
+        if [[ "$suite" == smoke ]]; then in_benches=(aime24); fi ;;
+    *) echo 'CSPD_SUITE must be full, table2, table3, mcsi, or smoke.' >&2; exit 2 ;;
+esac
 jobs=()
 for method in "${in_methods[@]}"; do
-    for bench in "${in_benches[@]}"; do jobs+=("$method/$bench"); done
-    case "$method" in
-        MCSI|student|mopd)
-            for bench in "${ood_benches[@]}"; do jobs+=("$method/$bench"); done ;;
-    esac
+    if (( run_in_domain )); then
+        for bench in "${in_benches[@]}"; do jobs+=("$method/$bench"); done
+    fi
+    if (( run_ood )); then
+        case "$method" in
+            MCSI|student|mopd)
+                for bench in "${ood_benches[@]}"; do jobs+=("$method/$bench"); done ;;
+        esac
+    fi
 done
 
+base_fallback=
 case "${1:-}" in
     --plan)
         if [[ "${2:-}" == all && $# == 2 ]]; then
@@ -34,8 +60,10 @@ case "${1:-}" in
         base_default=lmsysorg/sglang:latest; runtime_default=blackwell ;;
     all)
         node=0; nodes=1; offline_default=1
-        base_default=docker.m.daocloud.io/lmsysorg/sglang:qwen38-27b-cu129; runtime_default=base ;;
-    *) printf 'Usage: bash environment/run_m2rl_docker.sh {0|1|all|--plan [all]}\n' >&2; exit 2 ;;
+        base_default=qwen-jev:x2-3-jev
+        base_fallback=docker.m.daocloud.io/lmsysorg/sglang:qwen38-27b-cu129
+        runtime_default=base ;;
+    *) printf 'Usage: CSPD_SUITE={full|table2|table3|mcsi|smoke} bash environment/run_m2rl_docker.sh {0|1|all|--plan [all]}\n' >&2; exit 2 ;;
 esac
 if (( $# != 1 )); then exit 2; fi
 
@@ -56,7 +84,9 @@ image="cspd-m2rl-repro:$commit-$runtime"
 root=${CSPD_OUT:-$PWD/artifacts/docker-repro}
 mkdir -p "$root"
 root=$(cd "$root" && pwd -P)
-out="$root/$commit/node-$1"
+run_root="$root/$commit"
+if [[ "$suite" != full ]]; then run_root="$run_root/$suite"; fi
+out="$run_root/node-$1"
 hf=${CSPD_HF_CACHE:-$root/hf}
 mkdir -p "$out" "$hf"
 hf=$(cd "$hf" && pwd -P)
@@ -69,17 +99,25 @@ while IFS=, read -r gpu total free; do
         exit 1
     fi
     if (( nodes == 1 && free * 100 < total * 95 )); then
-        echo "GPU $gpu has less than 95% free VRAM; wait for it to become idle." >&2
-        exit 1
+        echo "GPU $gpu has less than 95% free VRAM." >&2
+        if [[ "$suite" == full ]]; then exit 1; fi
+        continue
     fi
     gpus+=("$gpu")
 done <<< "$gpu_rows"
-if (( nodes == 1 && ${#gpus[@]} != 8 )); then
+if [[ -z "${gpus[0]:-}" ]]; then echo 'No eligible NVIDIA GPUs.' >&2; exit 1; fi
+if [[ "$suite" == full ]] && (( nodes == 1 && ${#gpus[@]} != 8 )); then
     echo "Expected 8 GPUs in all mode, found ${#gpus[@]}." >&2
     exit 1
 fi
 nvidia-smi -L
+if [[ -z "${CSPD_BASE:-}" && -n "$base_fallback" ]] &&
+    ! docker image inspect "$base" >/dev/null 2>&1 &&
+    docker image inspect "$base_fallback" >/dev/null 2>&1; then
+    base=$base_fallback
+fi
 docker image inspect "$base" >/dev/null
+printf 'Using Docker base image %s with %s runtime\n' "$base" "$runtime"
 
 context=$(mktemp -d "$root/.docker-context.XXXXXX")
 trap 'rm -rf "$context"' EXIT
@@ -131,7 +169,8 @@ print(f"M2RL-SFT ready: {model}")
 fi
 dock cpu bash -c 'mkdir -p /out/in; cp -r experiments/m2rl/eval/inputs/. /out/in/'
 gpqa="$out/in/gpqa_diamond/questions.jsonl"
-if [[ ! -s "$gpqa" ]] || [[ $(wc -l < "$gpqa") -ne 198 ]]; then
+if [[ "$suite" == full || "$suite" == table2 || "$suite" == mcsi ]] &&
+    { [[ ! -s "$gpqa" ]] || [[ $(wc -l < "$gpqa") -ne 198 ]]; }; then
     if ! docker run --rm --pull=never --user "$(id -u):$(id -g)" \
         -e NVIDIA_VISIBLE_DEVICES=void -e HF_TOKEN -e HF_HOME=/hf -e HF_HUB_CACHE=/hf/hub \
         -e "HF_HUB_OFFLINE=$offline" -e "TRANSFORMERS_OFFLINE=$offline" -v "$out:/out" -v "$hf:/hf" \
@@ -141,18 +180,20 @@ if [[ ! -s "$gpqa" ]] || [[ $(wc -l < "$gpqa") -ne 198 ]]; then
 fi
 unset HF_TOKEN
 
-for order in MCSI ISCM I SI CSI MSI MCI MCS M C S; do
+for order in "${prompt_orders[@]}"; do
     file="$out/prompts/$order.safetensors"
     if [[ -s "$file" ]]; then continue; fi
     dock cpu "$gen" "$m/compose.py" --paper-order "$order" --output "/out/prompts/$order.safetensors.part"
     mv "$file.part" "$file"
 done
-for bench in "${ood_benches[@]}"; do
-    if [[ "$bench" == bfcl ]]; then continue; fi
-    if [[ -s "$out/ood/$bench/questions.jsonl" && -s "$out/ood/$bench/references.jsonl" ]]; then continue; fi
-    dock cpu "$gen" "$m/ood/build_inputs.py" --output /out/ood --benches "$bench" ||
-        echo "Could not prepare $bench; continuing with the other benchmarks." >&2
-done
+if (( run_ood )); then
+    for bench in "${ood_benches[@]}"; do
+        if [[ "$bench" == bfcl ]]; then continue; fi
+        if [[ -s "$out/ood/$bench/questions.jsonl" && -s "$out/ood/$bench/references.jsonl" ]]; then continue; fi
+        dock cpu "$gen" "$m/ood/build_inputs.py" --output /out/ood --benches "$bench" ||
+            echo "Could not prepare $bench; continuing with the other benchmarks." >&2
+    done
+fi
 
 score_lcb() {
     docker run --rm --pull=never --init --network none --read-only \
@@ -205,6 +246,7 @@ run_job() {
             *) inputs=/out/ood; grader="$m/ood/score.py"
                case "$bench" in truthfulqa|xstest) k=4 ;; *) k=1 ;; esac ;;
         esac
+        if [[ "$suite" == smoke ]]; then k=1; fi
         local questions="$out${inputs#/out}/$bench/questions.jsonl"
         local references="$out${inputs#/out}/$bench/references.jsonl"
         if [[ ! -s "$questions" || ! -s "$references" ]]; then echo "Missing inputs for $bench"; return 1; fi
@@ -214,7 +256,7 @@ run_job() {
         expected=$((count * k))
         if [[ ! -s "$responses" ]] || (( $(wc -l < "$responses") != expected )); then
             dock "$gpu" "$gen" "$m/eval/generate.py" --bench "$bench" --inputs "$inputs" \
-                "${model[@]}" --output "$dir/responses.jsonl.part" || return 1
+                "${model[@]}" --k "$k" --output "$dir/responses.jsonl.part" || return 1
             if (( $(wc -l < "$responses.part") != expected )); then echo 'Incomplete generation'; return 1; fi
             mv "$responses.part" "$responses" || return 1
         fi

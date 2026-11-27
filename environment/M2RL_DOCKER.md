@@ -1,8 +1,43 @@
 # M2RL Docker 批量评测
 
+## 从试跑到对照论文
+
+在有 NVIDIA GPU 和 Docker 的主机上，从仓库根目录执行。单机模式优先使用本地镜像 `qwen-jev:x2-3-jev`，可用 `CSPD_BASE` 显式指定镜像。以下例子沿用已有的 Hugging Face 缓存，按实际路径修改 `CSPD_HF_CACHE`。
+
+```bash
+export CSPD_OUT="$PWD/artifacts/paper-check"
+export CSPD_HF_CACHE="$PWD/artifacts/docker-repro/hf"
+export CSPD_HF_OFFLINE=1
+
+CSPD_SUITE=smoke bash environment/run_m2rl_docker.sh --plan all
+CSPD_SUITE=smoke bash environment/run_m2rl_docker.sh all
+```
+
+`smoke` 只跑 MCSI 的 AIME24，每题生成一次，用来检查模型、软提示、生成和评分能否串起来。正式评测使用论文的采样数。下列子集在单机模式中使用可用的空闲卡，每卡同一时间运行一项任务。
+
+| `CSPD_SUITE` | 任务数 | 内容 |
+| --- | ---: | --- |
+| `smoke` | 1 | MCSI AIME24，K=1 |
+| `mcsi` | 4 | Table 2 的 MCSI，K=64/8/16/8 |
+| `table2` | 24 | Table 2 中可直接用发布产物跑的六个方法 |
+| `table3` | 18 | Table 3 的 Student、MOPD、MCSI |
+| `full` | 66 | 默认评测集，包含域内、域外和模块增删实验 |
+
+先跑论文的 MCSI 主结果，再用校验脚本生成分数对照表。GPQA-Diamond 需要已授权的数据缓存，或者在联网模式下配置有数据集权限的 `HF_TOKEN`。LiveCodeBench 评分由启动器放进断网的隔离容器。
+
+```bash
+CSPD_SUITE=mcsi bash environment/run_m2rl_docker.sh all
+commit=$(git rev-parse --short=12 HEAD)
+python3 environment/verify_m2rl.py "$CSPD_OUT/$commit/mcsi/node-all" --table 2 --method MCSI
+```
+
+要验证其他已发布方法，可改用 `CSPD_SUITE=table2` 或 `CSPD_SUITE=table3`，将校验命令的目录和 `--table` 一起改成对应实验，并省略 `--method`。双机结果放在同一运行目录的 `node-0/` 和 `node-1/` 下时，向校验脚本传它们的父目录。
+
+校验脚本检查题数、采样数和评分文件，输出实测分、论文分和差值。缺项、重复或计数不符时返回非零状态，且该方法不计算均分。上游 B200 复跑经验是单项约 ±1.5 分、四项均分约 ±0.5 分，可用于排查明显偏差。 [论文分数](../README.md#composing-experts-table-2) · [上游复现说明](../AGENTS.md#comparing-with-the-paper)
+
 ## 单机八卡（x2-4）
 
-在 x2-4 从 CSPD 仓库根目录执行。单机模式默认使用本地镜像 `docker.m.daocloud.io/lmsysorg/sglang:qwen38-27b-cu129` 的生成环境；可通过 `CSPD_BASE` 和 `CSPD_GEN_RUNTIME` 覆盖。启动器要求八张卡各有至少 95% 空闲显存；每张卡独立处理一项评测，不使用八卡张量并行。
+从 CSPD 仓库根目录执行。单机模式优先使用本地镜像 `qwen-jev:x2-3-jev`，该镜像不在本地时回退到 `docker.m.daocloud.io/lmsysorg/sglang:qwen38-27b-cu129`。可通过 `CSPD_BASE` 和 `CSPD_GEN_RUNTIME` 覆盖。默认完整评测要求八张卡各有至少 95% 空闲显存，每张卡独立处理一项评测。
 
 ```bash
 cd /mnt_upfs/spl/gitlab/CSPD
