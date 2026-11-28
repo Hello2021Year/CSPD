@@ -70,9 +70,9 @@ def balanced_ranks(indices, entries, world):
 
 
 def prefix_pool(entries, tokens):
-    """Prompt-side token spans (system region onwards, before the response) of 2,048 records."""
+    """Prompt-side token spans from up to 2,048 records."""
     rng = np.random.default_rng(PREFIX_POOL_SEED)
-    pick = rng.choice(len(entries), size=PREFIX_POOL_SIZE, replace=False)
+    pick = rng.choice(len(entries), size=min(PREFIX_POOL_SIZE, len(entries)), replace=False)
     pool = [
         np.array(tokens[entries[i]["offset"] + entries[i]["insert_at"]: entries[i]["offset"] + entries[i]["prefix_tokens"]], dtype=np.int64)
         for i in pick
@@ -209,7 +209,7 @@ def parse_args(argv=None):
     return args
 
 
-def main(argv=None):
+def main(argv=None, *, student_loader=None):
     args = parse_args(argv)
     from transformers import AutoModelForCausalLM, AutoTokenizer
 
@@ -230,9 +230,16 @@ def main(argv=None):
     torch.manual_seed(args.seed)
 
     entries, tokens = load_packed(args.data)
+    pool = [] if args.no_prefix_robust else prefix_pool(entries, tokens)
+    if not args.no_prefix_robust and not pool:
+        raise ValueError("prefix-robust training needs at least one 32-token prefix span")
     dtype = torch.bfloat16 if device.type == "cuda" else torch.float32
-    student = AutoModelForCausalLM.from_pretrained(args.model, revision=args.revision, torch_dtype=dtype,
-                                                   attn_implementation="sdpa").to(device)
+    if student_loader is None:
+        student = AutoModelForCausalLM.from_pretrained(args.model, revision=args.revision, torch_dtype=dtype,
+                                                       attn_implementation="sdpa")
+    else:
+        student = student_loader(args.model, dtype)
+    student = student.to(device)
     tokenizer = AutoTokenizer.from_pretrained(args.model, revision=args.revision)
     init = SimpleNamespace(method="sampled_vocabulary", seed=42)
     prompt = initialize_prompt_embeddings(student, tokenizer, init, args.prompt_length)
@@ -244,7 +251,7 @@ def main(argv=None):
     if args.frozen_prompts:
         frozen = torch.cat([torch.load(p, map_location="cpu", weights_only=True)["prompt"].float()
                             for p in args.frozen_prompts]).to(device).requires_grad_(False)
-    PromptLayout(prefix_pool(entries, tokens), prefix_robust=not args.no_prefix_robust, frozen=frozen).install(wrapper)
+    PromptLayout(pool, prefix_robust=not args.no_prefix_robust, frozen=frozen).install(wrapper)
     optimizer = make_optimizer(args.optimizer, wrapper.prompt_parameter)
 
     ckpt_dir = args.output / "checkpoints"

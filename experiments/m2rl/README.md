@@ -40,3 +40,19 @@ Runtime versions: generation uses SGLang 0.5.18 (`scripts/setup_blackwell_runtim
 **Out of domain.** `ood/build_inputs.py` builds TriviaQA (2,000 closed-book questions), TruthfulQA MC1 (817, K = 4), XSTest (450, K = 4, judged by Qwen3Guard-Gen-8B), the BBEH mini set and FinQA (1,147) from the public sources. BFCL v3 (15 categories, 4,041 cases in `ood/bfcl/cases.json`) runs with `ood/bfcl/run.py`: each case uses BFCL's official `QwenFCHandler` and checker (gorilla commit `cd9429c`) in a worker process, while generation goes through SGLang with the soft prompt inserted after the system header; `ood/bfcl/aggregate.py` computes the weighted score.
 
 **Versions.** Every dataset and grader revision is listed in [BENCHMARKS.md](BENCHMARKS.md).
+
+## Custom JEV judge soft prompt
+
+This workflow uses the existing `yes` and `no` labels as supervision, not the paper's teacher sampler or benchmarks. Keep the dataset and output in a private directory. For a single trainable vector on the local Qwen3.8-27B checkpoint, use a training Python with CUDA, BF16, a Transformers build that exposes `Qwen3_5ForConditionalGeneration`, Liger Kernel, and CSPD installed. The older pinned paper scoring environment is not a Qwen3.8 training environment.
+
+```bash
+cd /mnt_upfs/spl/gitlab/CSPD
+JEV_ROOT=/mnt_upfs/spl/gitlab/CSPD/artifacts/jev
+CUDA_VISIBLE_DEVICES=0 HF_HUB_OFFLINE=1 python experiments/m2rl/train_jev.py \
+  --data "$JEV_ROOT/jev_datasets_yes_no.zip" --model /mnt_upfs/qwen3 \
+  --output "$JEV_ROOT/qwen38-smoke" --smoke
+```
+
+The script looks for `config.json` in the given directory or a standard `Qwen3.8-27B` subdirectory; pass the actual checkpoint path for other layouts. It reads local unquantized weights, freezes the text backbone, and exports `jev_soft_prompt.safetensors` with shape `[1, hidden_size]`. Only the label contributes to the loss by default; use `--with-turn-end` to also learn to stop. The standalone `pack_jev.py` keeps its original label-plus-end default and offers `--label-only`.
+
+Use `--prepare-only` to check tokenization without weights or CUDA. After the one-row, one-update smoke test, use a new output directory and omit `--smoke` for training. Set `--context-length` to a length the GPU can handle; the script does not truncate long history, and `--skip-oversize` explicitly excludes and records rows above the budget. Validation and test stay separate. The script uses one GPU and does not shard the model. Check free memory before running; a long 27B training sample can exceed an 80 GiB card.
