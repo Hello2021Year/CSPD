@@ -55,4 +55,14 @@ CUDA_VISIBLE_DEVICES=0 HF_HUB_OFFLINE=1 python experiments/m2rl/train_jev.py \
 
 The script looks for `config.json` in the given directory or a standard `Qwen3.8-27B` subdirectory; pass the actual checkpoint path for other layouts. It reads local unquantized weights, freezes the text backbone, and exports `jev_soft_prompt.safetensors` with shape `[1, hidden_size]`. Only the label contributes to the loss by default; use `--with-turn-end` to also learn to stop. The standalone `pack_jev.py` keeps its original label-plus-end default and offers `--label-only`.
 
-Use `--prepare-only` to check tokenization without weights or CUDA. After the one-row, one-update smoke test, use a new output directory and omit `--smoke` for training. Set `--context-length` to a length the GPU can handle; the script does not truncate long history, and `--skip-oversize` explicitly excludes and records rows above the budget. Validation and test stay separate. The script uses one GPU and does not shard the model. Check free memory before running; a long 27B training sample can exceed an 80 GiB card.
+Use `--prepare-only` to check tokenization without weights or CUDA. After the one-row, one-update smoke test, use a new output directory and omit `--smoke` for training. Set `--context-length` to a length the GPU can handle; the script does not truncate long history, and `--skip-oversize` explicitly excludes and records rows above the budget. Validation and test stay separate.
+
+For a four-GPU smoke test, choose four idle GPUs and run one Python process, not `torchrun`:
+
+```bash
+CUDA_DEVICE_ORDER=PCI_BUS_ID CUDA_VISIBLE_DEVICES=4,5,6,7 HF_HUB_OFFLINE=1 python experiments/m2rl/train_jev.py \
+  --data "$JEV_ROOT/jev_datasets_yes_no.zip" --model /mnt_upfs/models/qwen3/Qwen3.8-27B \
+  --output "$JEV_ROOT/qwen38-smoke-4gpu" --model-parallel --smoke
+```
+
+Model parallelism splits successive decoder layers across the visible GPUs and transfers activations between them for the same sample. It loads the original checkpoint into host memory before placing the text decoder on the GPUs. It does not replicate the whole student per GPU or change the loss.

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import math
 import random
+from contextlib import nullcontext
 from dataclasses import dataclass
 from typing import Any, Iterable, Sequence
 
@@ -275,7 +276,7 @@ class SoftPromptModel:
                 for row, position in enumerate(insert_at.tolist())
             ]
         )
-        targets = aligned_labels[:, 1:]
+        targets = aligned_labels[:, 1:].to(hidden.device)
         selected_mask = targets.ne(-100)
         token_count = int(selected_mask.sum().item())
         if token_count == 0:
@@ -283,14 +284,17 @@ class SoftPromptModel:
         head_device = output_head.weight.device
         assert self._liger_loss is not None
         shifted_hidden = hidden[:, :-1, :]
+
+        def fused_loss(response_hidden, response_targets):
+            guard = torch.cuda.device(head_device) if head_device.type == "cuda" else nullcontext()
+            with guard:
+                return self._liger_loss(
+                    output_head.weight, response_hidden.to(head_device), response_targets.to(head_device),
+                    bias=getattr(output_head, "bias", None),
+                )
+
         if self.loss_normalization == "token":
-            loss = self._liger_loss(
-                output_head.weight,
-                shifted_hidden[selected_mask].to(head_device),
-                targets[selected_mask].to(head_device),
-                bias=getattr(output_head, "bias", None),
-            )
-            return loss, token_count
+            return fused_loss(shifted_hidden[selected_mask], targets[selected_mask]), token_count
         sequence_losses = []
         for row in range(targets.size(0)):
             row_mask = selected_mask[row]
@@ -298,14 +302,7 @@ class SoftPromptModel:
                 raise ValueError(
                     f"training batch row {row} contains no response loss tokens"
                 )
-            sequence_losses.append(
-                self._liger_loss(
-                    output_head.weight,
-                    shifted_hidden[row, row_mask].to(head_device),
-                    targets[row, row_mask].to(head_device),
-                    bias=getattr(output_head, "bias", None),
-                )
-            )
+            sequence_losses.append(fused_loss(shifted_hidden[row, row_mask], targets[row, row_mask]))
         return torch.stack(sequence_losses).mean(), token_count
 
     __call__ = forward

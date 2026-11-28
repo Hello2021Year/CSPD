@@ -209,7 +209,7 @@ def parse_args(argv=None):
     return args
 
 
-def main(argv=None, *, student_loader=None):
+def main(argv=None, *, student_loader=None, student_placement=None):
     args = parse_args(argv)
     from transformers import AutoModelForCausalLM, AutoTokenizer
 
@@ -239,7 +239,7 @@ def main(argv=None, *, student_loader=None):
                                                        attn_implementation="sdpa")
     else:
         student = student_loader(args.model, dtype)
-    student = student.to(device)
+    student = student.to(device) if student_placement is None else student_placement(student, device)
     tokenizer = AutoTokenizer.from_pretrained(args.model, revision=args.revision)
     init = SimpleNamespace(method="sampled_vocabulary", seed=42)
     prompt = initialize_prompt_embeddings(student, tokenizer, init, args.prompt_length)

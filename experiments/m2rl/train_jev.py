@@ -3,7 +3,8 @@
 import argparse
 import json
 import os
-from functools import partial
+from contextlib import nullcontext
+from functools import partial, wraps
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -35,6 +36,49 @@ class QwenTextStudent(torch.nn.Module):
     def forward(self, **kwargs):
         hidden = self.model(**kwargs).last_hidden_state
         return SimpleNamespace(logits=self.lm_head(hidden))
+
+
+def stage_forward(forward, device):
+    def move(value):
+        if isinstance(value, torch.Tensor):
+            return value.to(device)
+        if isinstance(value, tuple):
+            return tuple(move(item) for item in value)
+        if isinstance(value, list):
+            return [move(item) for item in value]
+        if isinstance(value, dict):
+            return {key: move(item) for key, item in value.items()}
+        return value
+
+    @wraps(forward)
+    def staged(*args, **kwargs):
+        guard = torch.cuda.device(device) if device.type == "cuda" else nullcontext()
+        with guard:
+            return forward(*move(args), **move(kwargs))
+
+    return staged
+
+
+def place_student(student, input_device, *, devices):
+    if len(devices) < 2 or devices[0] != input_device:
+        raise ValueError("model-parallel stages must begin on the training input device")
+    decoder = student.model
+    layers = decoder.layers
+    if len(layers) < len(devices):
+        raise ValueError("model parallelism needs at least one decoder layer per GPU")
+    embedding = student.get_input_embeddings().to(devices[0])
+    decoder.rotary_emb.to(devices[0])
+    decoder.norm.to(devices[-1])
+    head = student.get_output_embeddings()
+    head.to(devices[0] if head.weight is embedding.weight else devices[-1])
+    for index, device in enumerate(devices):
+        start = index * len(layers) // len(devices)
+        stop = (index + 1) * len(layers) // len(devices)
+        for layer in layers[start:stop]:
+            layer.to(device)
+            layer.forward = stage_forward(layer.forward, device)
+        print(f"Model shard {device}: decoder layers {start}–{stop - 1}", flush=True)
+    return student
 
 
 def resolve_checkpoint(path):
@@ -78,16 +122,25 @@ def run(args):
     if args.updates < 1 or args.batch_size < 1:
         raise ValueError("--updates and --batch-size must be positive")
     batch_size = 1 if args.smoke else args.batch_size
+    placement = None
     if not args.prepare_only:
-        if "RANK" in os.environ or not torch.cuda.is_available() or torch.cuda.device_count() != 1:
-            raise RuntimeError("run directly with Python and expose one CUDA GPU via CUDA_VISIBLE_DEVICES")
-        if not torch.cuda.is_bf16_supported():
-            raise RuntimeError("training needs a GPU with BF16 support")
+        gpu_count = torch.cuda.device_count()
+        if "RANK" in os.environ or not torch.cuda.is_available():
+            raise RuntimeError("run directly with Python on CUDA; do not use torchrun")
+        if (args.model_parallel and gpu_count < 2) or (not args.model_parallel and gpu_count != 1):
+            raise RuntimeError("expose one CUDA GPU, or expose multiple CUDA GPUs with --model-parallel")
         model_class(kind)
         from liger_kernel.transformers import LigerFusedLinearCrossEntropyLoss
 
-        free, _ = torch.cuda.mem_get_info()
-        print(f"GPU: {torch.cuda.get_device_name(0)}, {free / 2**30:.1f} GiB free", flush=True)
+        devices = tuple(torch.device("cuda", index) for index in range(gpu_count))
+        for device in devices:
+            with torch.cuda.device(device):
+                if not torch.cuda.is_bf16_supported():
+                    raise RuntimeError(f"{device} lacks BF16 support")
+                free, _ = torch.cuda.mem_get_info()
+                print(f"GPU {device}: {torch.cuda.get_device_name(device)}, {free / 2**30:.1f} GiB free", flush=True)
+        if args.model_parallel:
+            placement = partial(place_student, devices=devices)
     tokenizer = transformers.AutoTokenizer.from_pretrained(
         checkpoint, local_files_only=True, trust_remote_code=False,
     )
@@ -113,7 +166,8 @@ def run(args):
     ]
     if args.smoke:
         options.extend(["--stop-after", "1"])
-    train_sp.main(options, student_loader=partial(load_student, model_type=kind, attention=args.attention))
+    train_sp.main(options, student_loader=partial(load_student, model_type=kind, attention=args.attention),
+                  student_placement=placement)
     states = sorted((output / "checkpoints").glob("update-*/state.pt"))
     if not states:
         raise RuntimeError("training produced no checkpoint")
@@ -140,6 +194,7 @@ def main():
     parser.add_argument("--updates", type=int, default=200)
     parser.add_argument("--batch-size", type=int, default=8)
     parser.add_argument("--attention", choices=("sdpa", "flash_attention_2"), default="sdpa")
+    parser.add_argument("--model-parallel", action="store_true", help="split decoder layers over the visible GPUs")
     parser.add_argument("--smoke", action="store_true", help="train on one row for one update")
     parser.add_argument("--prepare-only", action="store_true", help="pack data without loading weights or using CUDA")
     parser.add_argument("--with-turn-end", action="store_true", help="also supervise the end-of-turn token")
